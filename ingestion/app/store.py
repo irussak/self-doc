@@ -737,7 +737,13 @@ def set_injection_decision(
 ) -> None:
     """Record a human (or automated auto-purge) decision on a quarantine
     row. `state='purged'` also NULLs `markdown` — see the schema's tombstone
-    comment for why the row itself is kept rather than deleted."""
+    comment for why the row itself is kept rather than deleted.
+
+    `state='allowed'` deliberately does NOT null `markdown`, even though the
+    content also now lives in `doc_chunks` after `index_quarantined_page`
+    runs: keeping it here is a durable, human-readable audit trail of
+    exactly what a reviewer approved, retrievable without cross-referencing
+    a `doc_chunks` row that a later re-chunk could have since replaced."""
     with conn.cursor() as cur:
         if state == "purged":
             cur.execute(
