@@ -15,7 +15,8 @@ order, not just the three sync-health incident scenarios:
   4. crawl_aborted_early                             -> partial
   5. pages_failed > 0                                -> partial
   6. soft-fail ratio > SOFT_FAIL_PARTIAL_RATIO        -> partial
-  7. otherwise                                       -> ok
+  7. injection-block ratio > INJECTION_BLOCK_PARTIAL_RATIO -> partial
+  8. otherwise                                       -> ok
 
 Rule order also matters: earlier rules must win even when a later rule's
 condition also holds (e.g. cancellation must report "failed" even if pages
@@ -25,7 +26,7 @@ were fetched, or even if the purge guard also refused).
 from __future__ import annotations
 
 import pytest
-from app.store import SOFT_FAIL_PARTIAL_RATIO, SourceOutcome, classify_sync
+from app.store import INJECTION_BLOCK_PARTIAL_RATIO, SOFT_FAIL_PARTIAL_RATIO, SourceOutcome, classify_sync
 
 
 def _outcome(**overrides) -> SourceOutcome:
@@ -38,6 +39,7 @@ def _outcome(**overrides) -> SourceOutcome:
         pages_soft_failed=0,
         pages_removed=0,
         chunks_indexed=0,
+        injection_blocked=0,
         error=None,
     )
     defaults.update(overrides)
@@ -173,7 +175,49 @@ def test_small_incidental_soft_failure_count_stays_ok():
     assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "ok"
 
 
-# --- Rule 7: otherwise ok.
+# --- Rule 7: injection-block ratio. A SEPARATE rule/constant from Rule 6
+# (soft-fail ratio) on purpose — an injection block is a different operator
+# concern from a soft-failed fetch, and folding it into the soft-fail ratio
+# would misattribute the cause in that rule's own log line.
+def test_injection_block_ratio_at_exactly_the_floor_is_still_ok():
+    fetched = 8
+    blocked = 2
+    assert blocked / (fetched + blocked) == INJECTION_BLOCK_PARTIAL_RATIO
+    outcome = _outcome(pages_fetched=fetched, injection_blocked=blocked)
+    assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "ok"
+
+
+def test_injection_block_ratio_just_over_the_floor_is_partial():
+    fetched = 7
+    blocked = 2
+    assert blocked / (fetched + blocked) > INJECTION_BLOCK_PARTIAL_RATIO
+    outcome = _outcome(pages_fetched=fetched, injection_blocked=blocked)
+    assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "partial"
+
+
+def test_injection_block_ratio_does_not_perturb_the_soft_fail_ratio_rule():
+    # A source with injection blocks but a CLEAN soft-fail ratio must not be
+    # flipped to partial by Rule 6 just because injection_blocked widened
+    # the shared pages_seen denominator.
+    outcome = _outcome(pages_fetched=95, pages_soft_failed=0, injection_blocked=5)
+    assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "ok"
+
+
+def test_all_pages_injection_blocked_is_failed_via_the_empty_crawl_rule():
+    # A source where EVERY page was quarantined still correctly falls
+    # through to Rule 2 (nothing indexed/confirmed) rather than needing its
+    # own special case — injection_blocked is deliberately excluded from
+    # that rule's sum, exactly like pages_soft_failed and pages_failed are.
+    outcome = _outcome(injection_blocked=40)
+    assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "failed"
+
+
+def test_small_incidental_injection_block_count_stays_ok():
+    outcome = _outcome(pages_fetched=200, injection_blocked=1)
+    assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "ok"
+
+
+# --- Rule 8: otherwise ok.
 def test_clean_sync_with_a_mix_of_fetched_skipped_not_modified_is_ok():
     outcome = _outcome(pages_fetched=3, pages_skipped=4, pages_not_modified=2)
     assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "ok"

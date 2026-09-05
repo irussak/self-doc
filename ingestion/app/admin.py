@@ -301,6 +301,7 @@ _sync_status: dict[str, Any] = {
     "pages_failed": 0,
     "shell_suspected_count": 0,
     "pages_js_rendered": 0,
+    "injection_blocked": 0,
     "last_url": "",
     "last_completed_summary": None,
 }
@@ -323,6 +324,7 @@ def _on_sync_progress(outcome: Any, current_url: str) -> None:
     _sync_status["pages_failed"] = _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed")
     _sync_status["shell_suspected_count"] = _safe_int(outcome, "shell_suspected_count")
     _sync_status["pages_js_rendered"] = _safe_int(outcome, "pages_js_rendered")
+    _sync_status["injection_blocked"] = _safe_int(outcome, "injection_blocked")
     _sync_status["last_url"] = str(current_url)
     _sync_status["message"] = f"Syncing {getattr(outcome, 'name', '')} ({_sync_status['pages_fetched']} indexed, {_sync_status['pages_skipped']} skipped)..."
 
@@ -352,6 +354,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
     _sync_status["pages_failed"] = 0
     _sync_status["shell_suspected_count"] = 0
     _sync_status["pages_js_rendered"] = 0
+    _sync_status["injection_blocked"] = 0
     _sync_status["last_url"] = ""
     outcome: store.SourceOutcome | None = None
     exc_message: str | None = None
@@ -386,6 +389,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
                     "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                     "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                     "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                    "injection_blocked": _safe_int(outcome, "injection_blocked"),
                     "error": _safe_str(outcome, "error"),
                     "finished_at": time.time(),
                 }
@@ -399,6 +403,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
                     "pages_failed": _sync_status.get("pages_failed", 0) + 1,
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "injection_blocked": _sync_status.get("injection_blocked", 0),
                     "error": exc_message or _sync_status.get("message", "Sync failed unexpectedly"),
                     "finished_at": time.time(),
                 }
@@ -427,6 +432,7 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
     _sync_status["pages_failed"] = 0
     _sync_status["shell_suspected_count"] = 0
     _sync_status["pages_js_rendered"] = 0
+    _sync_status["injection_blocked"] = 0
     _sync_status["last_url"] = ""
     outcome: store.SourceOutcome | None = None
     exc_message: str | None = None
@@ -461,6 +467,7 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
                     "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                     "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                     "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                    "injection_blocked": _safe_int(outcome, "injection_blocked"),
                     "error": _safe_str(outcome, "error"),
                     "finished_at": time.time(),
                 }
@@ -474,6 +481,7 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
                     "pages_failed": _sync_status.get("pages_failed", 0) + 1,
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "injection_blocked": _sync_status.get("injection_blocked", 0),
                     "error": exc_message or _sync_status.get("message", "Upload ingestion failed unexpectedly"),
                     "finished_at": time.time(),
                 }
@@ -507,6 +515,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
     _sync_status["pages_failed"] = 0
     _sync_status["shell_suspected_count"] = 0
     _sync_status["pages_js_rendered"] = 0
+    _sync_status["injection_blocked"] = 0
     _sync_status["last_url"] = ""
     results: dict[str, store.SourceOutcome] | None = None
     exc_message: str | None = None
@@ -540,6 +549,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                 total_failed = sum(_safe_int(o, "pages_failed") + _safe_int(o, "pages_soft_failed") for o in results.values())
                 total_shell_suspected = sum(_safe_int(o, "shell_suspected_count") for o in results.values())
                 total_js_rendered = sum(_safe_int(o, "pages_js_rendered") for o in results.values())
+                total_injection_blocked = sum(_safe_int(o, "injection_blocked") for o in results.values())
                 any_failed = any(_safe_str(o, "status") == "failed" for o in results.values())
                 errors = [_safe_str(o, "error") for o in results.values() if _safe_str(o, "error")]
                 _sync_status["last_completed_summary"] = {
@@ -551,6 +561,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                     "pages_failed": total_failed,
                     "shell_suspected_count": total_shell_suspected,
                     "pages_js_rendered": total_js_rendered,
+                    "injection_blocked": total_injection_blocked,
                     "error": "; ".join(errors) if errors else None,
                     "finished_at": time.time(),
                 }
@@ -564,6 +575,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                     "pages_failed": _sync_status.get("pages_failed", 0) + 1,
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "injection_blocked": _sync_status.get("injection_blocked", 0),
                     "error": exc_message or _sync_status.get("message", "Full sync failed unexpectedly"),
                     "finished_at": time.time(),
                 }
@@ -1299,6 +1311,7 @@ def sync_source_submit(
         _sync_status["pages_failed"] = 0
         _sync_status["shell_suspected_count"] = 0
         _sync_status["pages_js_rendered"] = 0
+        _sync_status["injection_blocked"] = 0
         _sync_status["last_url"] = ""
         outcome = None
         try:
@@ -1320,6 +1333,7 @@ def sync_source_submit(
                         "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                         "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                         "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                        "injection_blocked": _safe_int(outcome, "injection_blocked"),
                         "error": _safe_str(outcome, "error"),
                         "finished_at": time.time(),
                     }
@@ -1478,6 +1492,7 @@ def refresh_source_submit(
         _sync_status["pages_failed"] = 0
         _sync_status["shell_suspected_count"] = 0
         _sync_status["pages_js_rendered"] = 0
+        _sync_status["injection_blocked"] = 0
         _sync_status["last_url"] = ""
         outcome = None
         try:
@@ -1499,6 +1514,7 @@ def refresh_source_submit(
                         "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                         "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                         "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                        "injection_blocked": _safe_int(outcome, "injection_blocked"),
                         "error": _safe_str(outcome, "error"),
                         "finished_at": time.time(),
                     }
@@ -1772,6 +1788,7 @@ def sync_all_submit(
         _sync_status["pages_failed"] = 0
         _sync_status["shell_suspected_count"] = 0
         _sync_status["pages_js_rendered"] = 0
+        _sync_status["injection_blocked"] = 0
         _sync_status["last_url"] = ""
         results: dict[str, store.SourceOutcome] = {}
         try:
@@ -1790,6 +1807,7 @@ def sync_all_submit(
                 total_failed = sum(_safe_int(o, "pages_failed") + _safe_int(o, "pages_soft_failed") for o in results.values())
                 total_shell_suspected = sum(_safe_int(o, "shell_suspected_count") for o in results.values())
                 total_js_rendered = sum(_safe_int(o, "pages_js_rendered") for o in results.values())
+                total_injection_blocked = sum(_safe_int(o, "injection_blocked") for o in results.values())
                 any_failed = any(_safe_str(o, "status") == "failed" for o in results.values())
                 errors = [_safe_str(o, "error") for o in results.values() if _safe_str(o, "error")]
                 _sync_status["last_completed_summary"] = {
@@ -1801,6 +1819,7 @@ def sync_all_submit(
                     "pages_failed": total_failed,
                     "shell_suspected_count": total_shell_suspected,
                     "pages_js_rendered": total_js_rendered,
+                    "injection_blocked": total_injection_blocked,
                     "error": "; ".join(errors) if errors else None,
                     "finished_at": time.time(),
                 }

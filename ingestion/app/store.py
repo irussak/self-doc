@@ -126,6 +126,21 @@ PURGE_RATIO_GUARD_MIN_EXISTING_PAGES = 20
 # all counts".
 SOFT_FAIL_PARTIAL_RATIO = 0.2
 
+# Ratio above which injection-blocked pages alone (independent of
+# pages_failed/pages_soft_failed) demote a sync from "ok" to "partial". A
+# SEPARATE constant and rule from SOFT_FAIL_PARTIAL_RATIO, deliberately: an
+# injection block and a soft failure are different operator concerns (a
+# flaky/slow-rendering upstream vs. a page needing admin review), and
+# folding injection_blocked into the soft-fail ratio would make that rule
+# fire for the wrong reason in its own log line. Without ANY ratio rule for
+# injection blocks, a source silently losing a fifth of its pages to
+# quarantine every sync would read "ok" forever — the same blind spot
+# SOFT_FAIL_PARTIAL_RATIO was added to close for soft failures. Same value
+# (0.2) as that sibling rule: no incident-specific calibration exists yet
+# for this one, so it borrows the nearest analogous, already-reviewed floor
+# rather than inventing an arbitrary new number.
+INJECTION_BLOCK_PARTIAL_RATIO = 0.2
+
 # --- JS-shell detection (T6) -------------------------------------------------
 #
 # Same traefik incident, a level deeper: `extraction_too_short` already
@@ -247,6 +262,7 @@ class SourceOutcome:
     chunks_indexed: int = 0
     shell_suspected_count: int = 0  # of pages_soft_failed, how many are suspected JS-shell stubs (T6)
     pages_js_rendered: int = 0  # of shell_suspected_count, how many were recovered via the renderer (T7)
+    injection_blocked: int = 0  # pages held out of the index by app.injection (quarantined or auto-purged)
     status: str = "ok"  # ok | partial | failed
     error: str | None = None
 
@@ -296,9 +312,22 @@ def classify_sync(
       partial - soft-failure ratio exceeds `SOFT_FAIL_PARTIAL_RATIO`:
                 `pages_soft_failed / pages_seen > SOFT_FAIL_PARTIAL_RATIO`,
                 where `pages_seen` includes every page category (fetched,
-                skipped, hard-failed, soft-failed, not-modified) — this is
-                the traefik case: 0 hard failures, but 117/280 (42%) of
-                pages silently lost to soft failures
+                skipped, hard-failed, soft-failed, not-modified,
+                injection-blocked) — this is the traefik case: 0 hard
+                failures, but 117/280 (42%) of pages silently lost to soft
+                failures
+      partial - injection-block ratio exceeds `INJECTION_BLOCK_PARTIAL_RATIO`:
+                `injection_blocked / pages_seen > INJECTION_BLOCK_PARTIAL_RATIO`.
+                A SEPARATE rule from the soft-failure one above, not folded
+                into it — a page held out of the index by app.injection's
+                prompt-injection scan is a different operator concern (it
+                needs admin review, not a retry) from a soft-failed fetch,
+                and this rule's own log line must say so rather than
+                reporting a soft-failure spike that isn't the real cause.
+                Without this rule, a source silently losing a large
+                fraction of its pages to quarantine every sync would read
+                "ok" forever — the exact blind spot the soft-failure rule
+                above was added to close for a different failure mode.
       ok      - otherwise
     """
     if outcome.error == "Aborted by user":
@@ -325,8 +354,12 @@ def classify_sync(
         + outcome.pages_failed
         + outcome.pages_soft_failed
         + outcome.pages_not_modified
+        + outcome.injection_blocked
     )
     if pages_seen > 0 and outcome.pages_soft_failed / pages_seen > SOFT_FAIL_PARTIAL_RATIO:
+        return "partial"
+
+    if pages_seen > 0 and outcome.injection_blocked / pages_seen > INJECTION_BLOCK_PARTIAL_RATIO:
         return "partial"
 
     return "ok"
