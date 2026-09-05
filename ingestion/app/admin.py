@@ -16,6 +16,9 @@ Routes (see module docstring sections below for detail):
     POST /admin/sources/{id}/upload    upload files (source_type='upload' only)
     POST /admin/sources/{id}/approve   pending -> active
     POST /admin/sources/{id}/reject    pending -> rejected
+    GET  /admin/quarantine             review queue for flagged (injection-suspected) pages
+    POST /admin/quarantine/{id}/allow  index immediately (human judged it a false positive)
+    POST /admin/quarantine/{id}/purge  tombstone (drop the retained content, keep the decision)
     GET  /admin/login                  login form (unauthenticated)
     POST /admin/login                  exchange SYNC_TOKEN for a session cookie
 
@@ -778,6 +781,24 @@ def _message_level(request: Request) -> str | None:
 # green success banner.
 _SUCCESS_SYNC_STATUSES = frozenset({"ok"})
 
+# `doc_quarantine.state` reaches a badge CSS class in quarantine.html — the
+# same whitelist-not-sanitizer pattern as `_message_level` above, for the
+# same reason (autoescaping blocks injection; an unvalidated value could
+# still name an arbitrary class in the stylesheet). An unrecognised state
+# renders as the warning style, never the success style, mirroring
+# `_level_suffix`'s "unknown -> warn, never green" rule.
+_ALLOWED_QUARANTINE_STATES = ("quarantined", "allowed", "purged")
+
+
+def _quarantine_badge_class(state: str) -> str:
+    if state == "allowed":
+        return "badge-success"
+    if state == "purged":
+        return "badge-error"
+    if state in _ALLOWED_QUARANTINE_STATES:
+        return "badge-warning"
+    return "badge-warning"  # unrecognised state — never render as success
+
 
 def _level_suffix(status: str) -> str:
     """`&level=warning` for a redirect reporting a non-success
@@ -866,6 +887,7 @@ def list_sources_view(request: Request, _auth=Depends(require_session), conn=Dep
     active = sources_repo.list_sources(conn, status="active")
     pending = sources_repo.list_sources(conn, status="pending")
     rejected = sources_repo.list_sources(conn, status="rejected")
+    quarantine_pending_count = store.count_quarantine_pending(conn)
     return templates.TemplateResponse(
         request,
         "admin/index.html",
@@ -874,6 +896,7 @@ def list_sources_view(request: Request, _auth=Depends(require_session), conn=Dep
             "active": active,
             "pending": pending,
             "rejected": rejected,
+            "quarantine_pending_count": quarantine_pending_count,
             "csrf_token": _expected_csrf_token(),
             "message": request.query_params.get("msg"),
             # Same severity contract as `_form_context`, so a `?level=` on an
@@ -1953,3 +1976,114 @@ def reject_source_submit(
     sources_repo.set_status(conn, source_id, "rejected")
     logger.info("admin_source_rejected", source_id=source_id, name=record.name)
     return RedirectResponse(url=f"/admin?msg=rejected+{record.name}", status_code=303)
+
+
+# --- Injection quarantine review queue ---------------------------------------------------------
+#
+# Content flagged by app.injection.scan() never reaches doc_pages/doc_chunks
+# (see store.py's _apply_injection_gate) — it lives in doc_quarantine
+# instead, reviewed here. This is its own page rather than a column on
+# /admin/docs (list_docs_view above) because that view is doc_pages-driven,
+# and quarantined content has no doc_pages row by construction.
+
+
+@router.get("/quarantine", response_class=HTMLResponse)
+def list_quarantine_view(
+    request: Request,
+    source_id: int | None = None,
+    _auth=Depends(require_session),
+    conn=Depends(get_conn),
+):
+    entries = store.list_quarantine(conn, source_id=source_id, state="quarantined", limit=200)
+    sources = sources_repo.list_sources(conn, status="active")
+    return templates.TemplateResponse(
+        request,
+        "admin/quarantine.html",
+        {
+            "request": request,
+            "entries": entries,
+            "sources": sources,
+            "selected_source_id": source_id,
+            "badge_class": _quarantine_badge_class,
+            "quarantine_pending_count": len(entries),
+            "csrf_token": _expected_csrf_token(),
+            "message": request.query_params.get("msg"),
+            "message_level": _message_level(request),
+        },
+    )
+
+
+@router.post("/quarantine/{quarantine_id}/allow", response_class=HTMLResponse)
+def allow_quarantine_submit(
+    quarantine_id: int,
+    request: Request,
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    """Index the flagged page's content IMMEDIATELY (see
+    `store.index_quarantined_page`'s docstring for why this doesn't wait for
+    the next scheduled sync). Takes the same sync lock every crawl/purge
+    route uses — this closes the race where a running sync's preloaded
+    `injection_decisions` map would otherwise go stale relative to a
+    just-clicked Allow."""
+    entry = store.get_quarantine_entry(conn, quarantine_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="quarantine entry not found")
+
+    acquired = try_acquire_sync_lock()
+    if not acquired:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Sync already running",
+                "message": "a sync is currently in progress; try Allow again shortly.",
+            },
+            status_code=409,
+        )
+    try:
+        store.index_quarantined_page(conn, quarantine_id)
+        if hasattr(conn, "commit"):
+            conn.commit()
+    except ValueError as e:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {"request": request, "heading": "Allow failed", "message": str(e)},
+            status_code=400,
+        )
+    except Exception as e:  # noqa: BLE001 - never 500 an admin action; report and keep the lock clean
+        logger.error("admin_quarantine_allow_failed", quarantine_id=quarantine_id, error=str(e))
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {"request": request, "heading": "Allow failed", "message": f"failed to index: {e}"},
+            status_code=500,
+        )
+    finally:
+        release_sync_lock()
+
+    logger.info("admin_quarantine_allowed", quarantine_id=quarantine_id, url=entry.url)
+    return RedirectResponse(url="/admin/quarantine?msg=allowed", status_code=303, headers={"HX-Trigger": "syncStatusUpdated"})
+
+
+@router.post("/quarantine/{quarantine_id}/purge", response_class=HTMLResponse)
+def purge_quarantine_submit(
+    quarantine_id: int,
+    request: Request,
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    entry = store.get_quarantine_entry(conn, quarantine_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="quarantine entry not found")
+
+    store.set_injection_decision(conn, quarantine_id, "purged")
+    if hasattr(conn, "commit"):
+        conn.commit()
+    logger.info("admin_quarantine_purged", quarantine_id=quarantine_id, url=entry.url)
+    # No &level=warning: a deliberate, successful admin action (the operator
+    # chose to purge) renders as plain success, matching how
+    # reject_source_submit above treats its own deliberate-negative outcome.
+    return RedirectResponse(url="/admin/quarantine?msg=purged", status_code=303)
