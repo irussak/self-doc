@@ -70,6 +70,7 @@ def _row_from_cfg(
     last_synced: datetime | None = None,
     last_status: str | None = None,
     source_type: str | None = None,
+    injection_auto_purge: bool | None = None,
 ) -> tuple:
     """Build a plain row tuple in SOURCE_COLUMNS order the way a real
     `SELECT ... FROM doc_sources` would return it (psycopg hands back TEXT[]
@@ -94,6 +95,9 @@ def _row_from_cfg(
         "last_synced": last_synced,
         "last_status": last_status,
         "source_type": source_type if source_type is not None else cfg.source_type,
+        "injection_auto_purge": (
+            injection_auto_purge if injection_auto_purge is not None else bool(cfg.injection_auto_purge)
+        ),
     }
     return tuple(values[col] for col in SOURCE_COLUMNS)
 
@@ -161,6 +165,25 @@ def test_cfg_to_write_values_sitemap_none_stays_none() -> None:
     cfg = _make_cfg(sitemap=None)
     _, sitemap, *_ = _cfg_to_write_values(cfg)
     assert sitemap is None
+
+
+def test_injection_auto_purge_defaults_false_and_round_trips() -> None:
+    cfg = _make_cfg()
+    assert cfg.injection_auto_purge is False
+
+    row = _row_from_cfg(cfg, id_=1)
+    record = _row_to_record(row)
+    assert record.injection_auto_purge is False
+
+    *_, injection_auto_purge = _cfg_to_write_values(cfg)
+    assert injection_auto_purge is False
+    assert _cfg_matches_record(cfg, record)
+
+    cfg_on = _make_cfg(injection_auto_purge=True)
+    record_off = _row_to_record(_row_from_cfg(cfg, id_=1))
+    assert not _cfg_matches_record(cfg_on, record_off), (
+        "a differing injection_auto_purge must be treated as a real config change"
+    )
 
 
 # --- Pure: _cfg_matches_record (import idempotency decision) ---------------

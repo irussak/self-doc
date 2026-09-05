@@ -638,6 +638,7 @@ def _build_source_config(
     rate_limit_rps: str,
     llms_txt: str = "auto",
     js_render: bool = False,
+    injection_auto_purge: bool = False,
     source_type: str = "crawl",
     taken: Collection[str] | None = None,
 ) -> tuple[SourceConfig | None, str | None]:
@@ -703,6 +704,7 @@ def _build_source_config(
             rate_limit_rps=rate_limit_rps_value,
             llms_txt=(llms_txt.strip() or "auto"),
             js_render=js_render,
+            injection_auto_purge=injection_auto_purge,
         )
         return cfg, None
     except ValidationError as e:
@@ -742,6 +744,7 @@ def _record_to_config(record: SourceRecord) -> SourceConfig:
         rate_limit_rps=record.rate_limit_rps if (record.rate_limit_rps is not None and record.rate_limit_rps > 0) else 1.0,
         llms_txt=record.llms_txt or "auto",
         js_render=record.js_render,
+        injection_auto_purge=record.injection_auto_purge,
     )
 
 
@@ -935,6 +938,7 @@ def create_source_submit(
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
     js_render: str = Form(default=""),
+    injection_auto_purge: str = Form(default=""),
     # Defaults to "crawl" if missing/empty for backward safety (e.g. a
     # stale cached form or a direct API call) — the create form itself
     # always submits an explicit value via its source-type radio group.
@@ -967,6 +971,7 @@ def create_source_submit(
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
         "js_render": bool(js_render),
+        "injection_auto_purge": bool(injection_auto_purge),
     }
     taken: Collection[str] = set()
     cfg, error = _build_source_config(
@@ -980,6 +985,7 @@ def create_source_submit(
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
         js_render=bool(js_render),
+        injection_auto_purge=bool(injection_auto_purge),
         source_type=source_type,
         taken=taken,
     )
@@ -1144,6 +1150,7 @@ def edit_source_form(source_id: int, request: Request, _auth=Depends(require_ses
         "rate_limit_rps": str(record.rate_limit_rps),
         "llms_txt": record.llms_txt or "auto",
         "js_render": record.js_render,
+        "injection_auto_purge": record.injection_auto_purge,
         "schedule_cron": record.schedule_cron or "",
         "enabled": record.enabled,
     }
@@ -1163,6 +1170,7 @@ def update_source_submit(
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
     js_render: str = Form(default=""),
+    injection_auto_purge: str = Form(default=""),
     schedule_cron: str = Form(default=""),
     enabled: str = Form(default=""),
     _auth=Depends(require_csrf),
@@ -1183,6 +1191,7 @@ def update_source_submit(
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
         "js_render": bool(js_render),
+        "injection_auto_purge": bool(injection_auto_purge),
         "schedule_cron": schedule_cron,
         "enabled": bool(enabled),
     }
@@ -1204,6 +1213,7 @@ def update_source_submit(
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
         js_render=bool(js_render),
+        injection_auto_purge=bool(injection_auto_purge),
         source_type=record.source_type,
     )
     if cfg is None:
@@ -1584,6 +1594,7 @@ def _upload_edit_values(record: SourceRecord) -> dict:
         "rate_limit_rps": str(record.rate_limit_rps),
         "llms_txt": record.llms_txt or "auto",
         "js_render": record.js_render,
+        "injection_auto_purge": record.injection_auto_purge,
         "schedule_cron": record.schedule_cron or "",
         "enabled": record.enabled,
     }
