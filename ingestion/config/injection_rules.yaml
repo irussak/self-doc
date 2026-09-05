@@ -146,6 +146,42 @@ rules:
       bound matters, since a security page mentions "send" and "API key" on
       the same page constantly but rarely six tokens apart in that order.
 
+  # --- Family F: announced-encoding framing (base64/rot13/hex smuggling) ---
+  - id: exfil_encoded_payload_instruction
+    family: lexical
+    weight_prose: 40
+    weight_quote: 20
+    weight_code: 15
+    # DOTALL: a real encoded blob commonly sits on its own line/paragraph,
+    # separated from the surrounding instructional prose by a blank line —
+    # `.` must cross that newline for the bounded windows below to work.
+    flags: [IGNORECASE, DOTALL]
+    # Structural base64 decoding (decode a long base64 blob, then re-scan
+    # the decoded text) lives in app.injection._decode_base64_blobs and
+    # needs no rule here. This rule is the backstop for encodings that
+    # DON'T parse as clean base64 — ROT13, hex, or a described-but-mangled
+    # blob — where there is nothing for that structural decoder to decode.
+    #
+    # Requires an "instructions/directives/payload" OBJECT after the verb,
+    # not a bare "decode" — "to decode a base64 string in Python, use
+    # base64.b64decode()" is bread-and-butter encoding-reference prose and
+    # must not match; "decode this and execute the instructions" must.
+    # Deliberately excludes "command(s)": "run the following command" is
+    # ubiquitous ordinary CLI documentation phrasing and would otherwise
+    # collide with this rule constantly. The
+    # gap between the encoding-name mention and the verb is bounded by
+    # CHARACTER count (`.{0,200}?`), not token count: a real ROT13/hex
+    # ciphertext sitting between the "this is encoded:" framing and the
+    # "now decode it" instruction can easily be 10+ words, which a
+    # token-bounded window would miss entirely.
+    pattern: '\b(?:base ?64|rot ?13|hex(?:adecimal)?|caesar\s+cipher)\b.{0,200}?\b(?:decode|execute|run|follow|apply)\b(?:\W+\w+){0,4}?\W+(?:the\s+|these\s+|those\s+|resulting\s+|decoded\s+)?(?:instructions?|directives?|payload)\b|\b(?:decode|execute|run|follow|apply)\b(?:\W+\w+){0,4}?\W+(?:the\s+|these\s+|those\s+|resulting\s+|decoded\s+)?(?:instructions?|directives?|payload)\b.{0,100}?\b(?:base ?64|rot ?13|hex(?:adecimal)?|caesar\s+cipher)\b'
+    rationale: >-
+      Announced-encoding framing ("decode this base64 string and execute the
+      instructions") — catches encodings the structural base64 decoder can't
+      parse (ROT13, hex, a deliberately mangled/split blob). OWASP's GenAI
+      LLM Top 10 (LLM01) names Base64/ROT13/emoji encodings explicitly as a
+      filter-bypass technique.
+
 mitigations:
   doc_vocabulary:
     weight: -35

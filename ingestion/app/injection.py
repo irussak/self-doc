@@ -21,9 +21,21 @@ entirely (never chunked, never embedded, never reaches `doc_chunks`) rather
 than being cleaned up and indexed anyway. `sanitize_for_storage` below
 removes only characters that are invisible to every renderer and carry no
 retrievable meaning (Tier S: zero-width joiners at a word boundary, bidi
-overrides, the Unicode Tags block used for "ASCII smuggling", etc.) — this
-never touches visible prose, and it runs so the corpus never carries an
-invisible payload even on pages that don't otherwise trip a rule.
+overrides, the Unicode Tags block AND variation-selector runs used for
+"ASCII/byte smuggling", etc.) — this never touches visible prose, and it
+runs so the corpus never carries an invisible payload even on pages that
+don't otherwise trip a rule.
+
+Two further evasion classes are handled purely in the DETECTION view (never
+mutating storage): homoglyph/confusable-character substitution (e.g. a
+Cyrillic "і" standing in for Latin "i" inside an otherwise-English trigger
+phrase, to dodge the Family A-D regexes below) is folded back to ASCII only
+inside tokens that mix scripts, so genuine non-Latin prose is untouched —
+see `_fold_confusable_homoglyphs`. Base64-looking blobs are decoded and the
+decoded text is re-scanned through the same ruleset — see
+`_decode_base64_blobs`. Both were added following OWASP's GenAI LLM Top 10
+(LLM01: Prompt Injection), which documents homoglyph/encoded-payload evasion
+and the variation-selector smuggling channel explicitly.
 
 WHY MARKDOWN, NOT RAW HTML
 ---------------------------
@@ -58,7 +70,10 @@ caller must render escaped — never pass to a structured logger.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import bisect
+import codecs
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -156,27 +171,71 @@ def decode_tag_characters(text: str) -> str:
     return "".join(chr(ord(ch) - 0xE0000) for ch in stripped if 0xE0020 <= ord(ch) <= 0xE007E)
 
 
+# Variation-selector byte smuggling — OWASP's GenAI LLM Top 10 (2026,
+# LLM01: Prompt Injection) names this alongside the Tags block above as a
+# confirmed steganographic channel (the same primitive behind the August
+# 2024 M365 Copilot ASCII-smuggling PoC that exfiltrated a Slack MFA code).
+# VS1-VS16 (U+FE00-FE0F) and VS17-VS256 (U+E0100-E01EF) together give 256
+# invisible codepoints — one per byte value 0x00-0xFF — appended after a
+# carrier character. A LONE variation selector is real, legitimate emoji/
+# text presentation selection (VS15/VS16 following a single base character);
+# there is no legitimate reason for two to appear back to back with no base
+# character between them, so only RUNS of >=2 consecutive selectors are
+# treated as an encoded payload — singleton use is left completely alone in
+# both the storage and detection views.
+_VS_RUN = re.compile("[︀-️\U000E0100-\U000E01EF]{2,}")
+
+
+def _vs_to_byte(cp: int) -> int | None:
+    if 0xFE00 <= cp <= 0xFE0F:
+        return cp - 0xFE00
+    if 0xE0100 <= cp <= 0xE01EF:
+        return cp - 0xE0100 + 16
+    return None
+
+
+def decode_variation_selectors(text: str) -> str:
+    """Recover bytes smuggled via runs of consecutive variation selectors
+    (see `_VS_RUN` above for why only runs, never singletons, are decoded)."""
+    out = bytearray()
+    for run in _VS_RUN.findall(text):
+        for ch in run:
+            b = _vs_to_byte(ord(ch))
+            if b is not None:
+                out.append(b)
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
 @dataclass(frozen=True)
 class InvisibleReport:
-    """Counts only — never raw text — except `decoded_tag_payload`, which is
-    the one case where showing a human the literal decoded string is the
-    entire point of the quarantine review screen."""
+    """Counts only — never raw text — except `decoded_tag_payload` and
+    `decoded_variation_payload`, the two cases where showing a human the
+    literal decoded string is the entire point of the quarantine review
+    screen."""
 
     tag_char_count: int
     decoded_tag_payload: str
     bidi_control_count: int
     intraword_zero_width_count: int
+    variation_selector_run_chars: int
+    decoded_variation_payload: str
 
 
 def _inspect_invisibles(text: str) -> InvisibleReport:
     tag_chars = sum(1 for ch in text if 0xE0000 <= ord(ch) <= 0xE007F)
     bidi = sum(1 for ch in text if ch in "‪‫‬‭‮⁦⁧⁨⁩")
     intraword = len(re.findall(r"(?<=[A-Za-z])[​‌‍⁠﻿­](?=[A-Za-z])", text))
+    vs_run_chars = sum(len(run) for run in _VS_RUN.findall(text))
     return InvisibleReport(
         tag_char_count=tag_chars,
         decoded_tag_payload=decode_tag_characters(text) if tag_chars else "",
         bidi_control_count=bidi,
         intraword_zero_width_count=intraword,
+        variation_selector_run_chars=vs_run_chars,
+        decoded_variation_payload=decode_variation_selectors(text) if vs_run_chars else "",
     )
 
 
@@ -210,28 +269,98 @@ def sanitize_for_storage(text: str) -> tuple[str, InvisibleReport]:
     working = _VALID_TAG_SEQUENCE.sub(_stash, text)
     working = working.translate(_INVISIBLE_DELETE_TABLE)
     working = _ILLEGITIMATE_JOINER.sub("", working)
+    # Runs of >=2 consecutive variation selectors are never legitimate (see
+    # _VS_RUN's docstring) — safe to strip unconditionally, even in the
+    # conservative storage view, without risking a real VS15/VS16 singleton.
+    working = _VS_RUN.sub("", working)
     for i, seq in enumerate(protected):
         working = working.replace(f"{_SENTINEL}FLAG{i}{_SENTINEL}", seq)
     return working, report
+
+
+# --- Homoglyph / confusable-character folding (detection view only) -------
+#
+# A small, curated subset of Unicode's confusables.txt: the Cyrillic/Greek
+# letters most commonly substituted for Latin lookalikes to evade a literal-
+# string filter — the same technique used for domain spoofing ("pаypal.com"
+# with a Cyrillic а instead of Latin a). Folding is scoped to tokens that
+# MIX Latin with a confusable character (see `_fold_confusable_homoglyphs`)
+# so it never touches genuine Russian/Greek/Armenian/Yiddish/Serbian prose —
+# all four are in config.SUPPORTED_FTS_LANGUAGES and appear as pure-script
+# tokens with no Latin admixture, which this check deliberately ignores.
+_CONFUSABLE_TO_LATIN: dict[str, str] = {
+    # Cyrillic lowercase
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y",
+    "і": "i", "ѕ": "s", "ј": "j", "ԁ": "d", "ѡ": "w", "ԛ": "q", "ϲ": "c",
+    # Cyrillic uppercase
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O",
+    "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X", "Ѕ": "S", "Ј": "J",
+    # Greek lowercase
+    "α": "a", "ο": "o", "ν": "v", "ι": "i", "ρ": "p", "υ": "y", "κ": "k",
+    "χ": "x",
+    # Greek uppercase
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K",
+    "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+}
+_LATIN_LETTER = re.compile(r"[A-Za-z]")
+_CONFUSABLE_CHAR = re.compile("[" + "".join(re.escape(c) for c in _CONFUSABLE_TO_LATIN) + "]")
+_WORD_TOKEN = re.compile(r"\w+", re.UNICODE)
+
+
+def _fold_confusable_homoglyphs(text: str) -> str:
+    """Fold confusable Cyrillic/Greek lookalikes to Latin ASCII, but ONLY
+    inside a token that mixes Latin letters with a confusable character —
+    e.g. 'іgnore' (Cyrillic і + Latin gnore) folds to 'ignore' so every
+    Family A-D regex sees through the substitution without needing to know
+    about it. A pure-script token has no Latin admixture and is returned
+    unchanged, which is what keeps this safe for legitimate non-Latin
+    prose."""
+    def _fold_token(m: re.Match[str]) -> str:
+        token = m.group(0)
+        if not (_LATIN_LETTER.search(token) and _CONFUSABLE_CHAR.search(token)):
+            return token
+        return "".join(_CONFUSABLE_TO_LATIN.get(ch, ch) for ch in token)
+
+    return _WORD_TOKEN.sub(_fold_token, text)
+
+
+def _find_homoglyph_tokens(text: str) -> list[str]:
+    """Every token `_fold_confusable_homoglyphs` would fold, in order. Used
+    only to size and illustrate the dedicated concealment signal in
+    `scan()` — the fold itself always happens inside `normalize_for_detection`
+    regardless of whether this list is empty, so every lexical rule sees the
+    folded text even when there's only one mixed-script token on the page."""
+    return [
+        m.group(0) for m in _WORD_TOKEN.finditer(text)
+        if _LATIN_LETTER.search(m.group(0)) and _CONFUSABLE_CHAR.search(m.group(0))
+    ]
 
 
 def normalize_for_detection(text: str) -> str:
     """Aggressively flatten `text` into the view Layer 2 rules see. Discarded
     immediately after scoring, never stored — so unlike `sanitize_for_storage`
     it strips ALL zero-width joiners regardless of context, decodes (rather
-    than deletes) the Unicode Tags block so the scorer sees the smuggled
-    text, and applies NFKC to fold Mathematical/fullwidth Latin lookalikes
-    (𝐢𝐠𝐧𝐨𝐫𝐞, ｉｇｎｏｒｅ) onto plain ASCII. NFKC is banned from the storage view
-    because it also rewrites legitimate content (fullwidth punctuation in
-    CJK docs, ligatures) — detection-view only.
+    than deletes) the Unicode Tags block and variation-selector runs so the
+    scorer sees the smuggled text, applies NFKC to fold Mathematical/
+    fullwidth Latin lookalikes (𝐢𝐠𝐧𝐨𝐫𝐞, ｉｇｎｏｒｅ) onto plain ASCII, and folds
+    homoglyph-substituted Latin lookalikes inside mixed-script tokens (see
+    `_fold_confusable_homoglyphs`). NFKC/confusable-folding are banned from
+    the storage view because both also rewrite legitimate content (fullwidth
+    punctuation in CJK docs, ligatures, genuine non-Latin prose) —
+    detection-view only.
     """
     smuggled = decode_tag_characters(text)
+    vs_smuggled = decode_variation_selectors(text)
     body = _VALID_TAG_SEQUENCE.sub(" ", text)
     body = body.translate(_INVISIBLE_DELETE_TABLE)
     body = _ALL_JOINERS.sub("", body)
+    body = _VS_RUN.sub(" ", body)
     body = unicodedata.normalize("NFKC", body)
+    body = _fold_confusable_homoglyphs(body)
     if smuggled:
         body = f"{body}\n\n{smuggled}"
+    if vs_smuggled:
+        body = f"{body}\n\n{vs_smuggled}"
     return body
 
 
@@ -514,6 +643,50 @@ def _score_lexical(
     return hits
 
 
+# --- Encoded-payload smuggling: base64 blobs, decoded and re-scanned ------
+#
+# OWASP's GenAI LLM Top 10 names Base64/ROT13/emoji encodings as a filter-
+# bypass technique ("bypass filters that never saw the encoding"). Base64 is
+# the one of those worth decoding structurally rather than only matching a
+# "please decode this" phrase: a long base64-alphabet run either decodes to
+# valid UTF-8 or it doesn't, with no ambiguity about the encoding scheme —
+# unlike ROT13, which requires guessing it's ROT13'd in the first place (that
+# weaker, announced-encoding case is instead covered by the
+# `exfil_encoded_payload_instruction` lexical rule in injection_rules.yaml).
+_BASE64_BLOB = re.compile(
+    r"(?<![A-Za-z0-9+/=])(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?(?![A-Za-z0-9+/=])"
+)
+_PRINTABLE_RATIO_MIN = 0.85
+
+
+def _decode_base64_blobs(text: str) -> list[str]:
+    """Find base64-looking runs of >=32 characters and return the ones that
+    actually decode to plausible UTF-8 text. A legitimate long base64 blob
+    that IS common in documentation (a JWT signature segment, an image
+    `data:` URI) decodes to non-printable bytes almost always, and is
+    correctly ignored here — this only surfaces blobs that decode to real
+    text, which a binary blob essentially never does by chance."""
+    decoded: list[str] = []
+    for m in _BASE64_BLOB.finditer(text):
+        candidate = m.group(0)
+        if len(candidate) % 4 != 0:
+            continue  # not a validly-padded base64 run; can't be real base64
+        try:
+            raw = base64.b64decode(candidate, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        try:
+            out = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if not out:
+            continue
+        printable = sum(1 for ch in out if ch.isprintable() or ch in "\n\r\t")
+        if printable / len(out) >= _PRINTABLE_RATIO_MIN:
+            decoded.append(out)
+    return decoded
+
+
 def scan(markdown: str, *, ruleset: Ruleset | None = None) -> InjectionVerdict:
     """Pure detection over one page's extracted markdown. No I/O, no DB, no
     env reads — `ruleset` defaults to the process-wide cached
@@ -565,6 +738,56 @@ def scan(markdown: str, *, ruleset: Ruleset | None = None) -> InjectionVerdict:
         concealment_hits.append(RuleHit(
             "hidden.bidi_control", "concealment", 60, "concealed", invisibles.bidi_control_count, "",
         ))
+    if invisibles.variation_selector_run_chars:
+        payload_hits = (
+            _score_lexical(normalize_for_detection(invisibles.decoded_variation_payload), [], rs,
+                            force_context="prose")
+            if invisibles.decoded_variation_payload else []
+        )
+        weight = 100 if payload_hits else 70
+        concealment_hits.append(RuleHit(
+            "hidden.variation_selector_payload", "concealment", weight, "concealed",
+            invisibles.variation_selector_run_chars, invisibles.decoded_variation_payload[:160],
+        ))
+
+    homoglyph_tokens = _find_homoglyph_tokens(markdown)
+    if homoglyph_tokens:
+        weight = min(100, 40 + 20 * len(homoglyph_tokens))
+        concealment_hits.append(RuleHit(
+            "hidden.homoglyph_confusable", "concealment", weight, "concealed",
+            len(homoglyph_tokens), homoglyph_tokens[0][:160],
+        ))
+
+    base64_payloads = _decode_base64_blobs(detect_view)
+    if base64_payloads:
+        malicious = [
+            p for p in base64_payloads
+            if _score_lexical(normalize_for_detection(p), [], rs, force_context="prose")
+        ]
+        weight = 100 if malicious else 35
+        excerpt = (malicious[0] if malicious else base64_payloads[0])[:160]
+        concealment_hits.append(RuleHit(
+            "hidden.base64_payload", "concealment", weight, "concealed", len(base64_payloads), excerpt,
+        ))
+
+    # ROT13 confirmation: when the announced-encoding rule (Family F, YAML)
+    # fires, its own matched excerpt necessarily contains the ciphertext
+    # sandwiched between the "ROT13 encoded:" framing and the "decode and
+    # execute" instruction (see that rule's pattern) — ROT13-decoding just
+    # that excerpt and rescanning turns "the page CLAIMS this is ROT13" into
+    # "the ROT13'd text IS an injection payload" when it actually decodes to
+    # one. ROT13 only rotates letters, so decoding the surrounding English
+    # framing words too is harmless — they become non-matching noise, never
+    # a false rule hit, since ROT13'd English is not English.
+    encoded_frame_hit = next((h for h in hits if h.rule_id == "exfil_encoded_payload_instruction"), None)
+    if encoded_frame_hit is not None and encoded_frame_hit.excerpt:
+        rot13_candidate = codecs.encode(encoded_frame_hit.excerpt, "rot13")
+        payload_hits = _score_lexical(normalize_for_detection(rot13_candidate), [], rs, force_context="prose")
+        if payload_hits:
+            concealment_hits.append(RuleHit(
+                "hidden.rot13_confirmed_payload", "concealment", 100, "concealed", 1, rot13_candidate[:160],
+            ))
+
     concealment_subtotal = sum(h.weight for h in concealment_hits)
 
     all_hits = tuple(hits) + tuple(concealment_hits)
