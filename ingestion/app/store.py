@@ -37,6 +37,15 @@ task description):
     arbitrary slice under the cap. (`crawler.discover_sitemap_urls` now also
     sorts URLs before applying the cap so repeated runs over an unchanged
     sitemap select the identical slice, independent of this guard.)
+  - Every page's resolved markdown is scanned for suspected indirect prompt
+    injection (`app.injection.scan`, gated by `_apply_injection_gate`)
+    BEFORE the hash-diff skip above — a flagged page is held out of
+    `doc_pages`/`doc_chunks` entirely rather than being indexed, and its
+    detection is recorded in `doc_quarantine` for human review (see
+    `db/init/05_injection_quarantine.sql`). Decisions are content-addressed
+    by `(url, content_hash)`, so a human's Allow/Purge override survives
+    re-syncs of unchanged content without being re-litigated. Controlled by
+    the `INJECTION_ENFORCE` env var (`off`/`shadow`/`on`, default `on`).
 """
 
 from __future__ import annotations
@@ -54,13 +63,43 @@ from urllib.parse import urlparse
 
 import psycopg
 
-from . import chunker, crawler, embedder, extract, metrics, renderer
+from . import chunker, crawler, embedder, extract, injection, metrics, renderer
 from .config import SourceConfig
 from .logging_config import get_logger
 from .sources_repo import SourceRecord
 from .uploads import UploadedDoc
 
 logger = get_logger(component="store")
+
+# --- Injection-scan enforcement level --------------------------------------
+#
+# A global rollout knob, independent of the per-source `injection_auto_purge`
+# setting: this controls whether app.injection.scan() runs AT ALL, and if it
+# does, whether a flag actually blocks/de-indexes the page.
+#
+#   "off"    - app.injection.scan() is never called. Byte-identical to this
+#              feature not existing. The escape hatch if the ruleset ever
+#              needs to be pulled entirely, fast.
+#   "shadow" - scan every page, record a quarantine row and the
+#              injection_blocked counter for anything flagged, but do NOT
+#              hold the page out of the index. Lets an operator measure the
+#              real false-positive rate against their own corpus (via the
+#              admin quarantine queue and `make eval`) before trusting the
+#              ruleset to actually remove anything.
+#   "on"     - full enforcement: a flagged page is held out of the index
+#              (this is the "isolate immediately" design) and a previously-
+#              indexed page that becomes flagged is de-indexed.
+#
+# Default "on": the confirmed design is that a flagged page never reaches an
+# agent's context by default — "shadow" is an opt-in staging step for an
+# operator who wants to measure before trusting, not the shipped default.
+# An unrecognized value degrades to "on" (fail toward NOT serving unreviewed
+# content) rather than "off" or "shadow" — the same "unknown -> the safe
+# option" convention already used for e.g. classify_sync's status handling.
+INJECTION_ENFORCE = os.environ.get("INJECTION_ENFORCE", "on").strip().lower()
+if INJECTION_ENFORCE not in ("off", "shadow", "on"):
+    logger.warning("injection_enforce_unknown_value_defaulting_to_on", value=INJECTION_ENFORCE)
+    INJECTION_ENFORCE = "on"
 
 # --- Purge-ratio guard (defense in depth for _delete_missing_pages) --------------------
 #
@@ -934,6 +973,101 @@ def _delete_missing_pages(
     return removed
 
 
+def _format_injection_evidence(verdict: injection.InjectionVerdict) -> str:
+    """Compact, human-scannable evidence string for `doc_quarantine.evidence`
+    (the admin list view's summary column — the FULL text lives in
+    `doc_quarantine.markdown` for the detail view). Rule id + a short excerpt
+    per hit, capped so the list view stays a table, not a wall of text.
+    NEVER passed to a logger — this is the one place matched attacker text
+    is allowed to land, per `logging_config.py`'s "never log raw page
+    bodies" rule; the log event alongside this call carries only
+    `rule_ids`/`score`."""
+    parts = [f"{h.rule_id}: {h.excerpt!r}" if h.excerpt else h.rule_id for h in verdict.hits[:8]]
+    return "; ".join(parts)[:1000]
+
+
+def _apply_injection_gate(
+    conn: psycopg.Connection,
+    source_id: int,
+    url: str,
+    markdown: str,
+    decisions: dict[tuple[str, str], str],
+    *,
+    auto_purge: bool,
+    log,
+) -> tuple[str, bool]:
+    """The injection-scan gate, run once per page ahead of the existing-hash
+    skip (see `sync_source`'s integration comment for why that placement is
+    load-bearing) and shared between the main crawl loop and the js_render
+    retry loop.
+
+    Returns `(content_hash, blocked)`. `content_hash` is always computed
+    over `verdict.sanitized_markdown` (the text that would actually be
+    indexed), not raw `markdown` — hashing the raw text would desynchronize
+    `content_hash` from stored content and make a future ruleset change
+    permanently invisible to drift detection. `blocked` is True only when
+    `INJECTION_ENFORCE == "on"` and this exact `(url, content_hash)` must not
+    be indexed this sync.
+
+    Every decision is content-addressed by `(url, content_hash)`: a prior
+    `'allowed'` decision for this exact hash means a human already judged
+    this exact content a false positive, so it is indexed without being
+    blocked (that override is never re-litigated against unchanged
+    content); a prior `'quarantined'`/`'purged'` decision blocks without
+    needing a fresh reason. `injection.scan()` itself still runs on every
+    call (the `decisions` lookup only changes what happens with the
+    verdict, not whether it's computed) — deliberately: scan cost is noise
+    against this pipeline's existing per-page budget (network fetch, rate
+    limiting, embedding inference; see the design's performance analysis),
+    and always scanning means a page is re-evaluated the moment its content
+    changes without needing a separate "is this hash stale" check.
+
+    `auto_purge` corresponds to the source's `injection_auto_purge` setting:
+    a freshly-flagged page is recorded as `state='purged'` (silent, no
+    review) instead of `'quarantined'` when set.
+    """
+    if INJECTION_ENFORCE == "off":
+        return hash_markdown(markdown), False
+
+    verdict = injection.scan(markdown)
+    content_hash = hash_markdown(verdict.sanitized_markdown)
+    prior_decision = decisions.get((url, content_hash))
+
+    if prior_decision == "allowed":
+        return content_hash, False
+    if prior_decision in ("quarantined", "purged"):
+        return content_hash, INJECTION_ENFORCE == "on"
+
+    if not verdict.flagged:
+        return content_hash, False
+
+    # Freshly flagged: no prior decision exists for this exact (url, hash).
+    # Stores `verdict.sanitized_markdown`, NOT raw `markdown` — content_hash
+    # is computed from the sanitized text, so storing anything else here
+    # would desynchronize the row's own hash from its own content, and would
+    # mean `index_quarantined_page`'s later Allow path indexes unsanitized
+    # text instead of what every other indexing path in this pipeline uses.
+    state = "purged" if auto_purge else "quarantined"
+    record_injection_detection(
+        conn, source_id, url, content_hash,
+        score=verdict.score, rule_ids=list(verdict.rule_ids),
+        evidence=_format_injection_evidence(verdict),
+        markdown=None if state == "purged" else verdict.sanitized_markdown,
+        state=state,
+    )
+    decisions[(url, content_hash)] = state
+    log.warning(
+        "page_injection_detected",
+        url=url,
+        score=verdict.score,
+        threshold=verdict.threshold,
+        rule_ids=list(verdict.rule_ids),
+        state=state,
+        enforce=INJECTION_ENFORCE,
+    )
+    return content_hash, INJECTION_ENFORCE == "on"
+
+
 def _update_source_status(conn: psycopg.Connection, name: str, status: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -981,6 +1115,14 @@ def sync_source(
     increments `pages_soft_failed`, logs a distinct `page_fetch_skipped` event, and
     continues without touching the existing row in the database.
 
+    Every page's resolved markdown passes through `_apply_injection_gate`
+    (see its docstring) before the existing-hash skip — a page flagged as a
+    suspected indirect prompt injection is held out of the index entirely
+    (never chunked, never embedded) when `INJECTION_ENFORCE == "on"` (the
+    default). This is INDEPENDENT of `pages_soft_failed`/`pages_failed`:
+    `outcome.injection_blocked` and `pages_injection_blocked_total` track it
+    separately, because an injection block needs admin review, not a retry.
+
     Raises `ValueError` immediately (before touching the database or the
     network) if `source.source_type == 'upload'` — an upload-type source has
     no URL to crawl (`base_url` is the `upload://{name}` sentinel, not a real
@@ -1015,6 +1157,15 @@ def sync_source(
         if llms_validators != (None, None):
             conditional[f"{origin}/llms-full.txt"] = llms_validators
             conditional[f"{origin}/llms.txt"] = llms_validators
+
+    # Preloaded once per sync (mirroring load_page_validators above), so the
+    # per-page injection-gate lookup inside the main loop costs no
+    # additional query in the common case of previously-seen, undecided
+    # content. See `_apply_injection_gate` for the (url, content_hash)
+    # decision-memory semantics.
+    injection_decisions = load_injection_decisions(conn, source_id)
+    injection_auto_purge = getattr(source, "injection_auto_purge", False)
+    injection_blocked_urls: list[str] = []
 
     try:
         try:
@@ -1134,9 +1285,24 @@ def sync_source(
                         continue
                     markdown = extraction.markdown
                 # else: llms.txt section, already-extracted markdown — skip
-                # extract.extract entirely.
+                # extract.extract entirely. Either way, `markdown` reaching
+                # here is exactly what the injection gate below must see —
+                # this is the one convergence point for both sub-paths (see
+                # `_apply_injection_gate`'s docstring for why the gate lives
+                # here rather than inside extract.extract, which the
+                # llms.txt path bypasses entirely).
 
-                content_hash = hash_markdown(markdown)
+                content_hash, blocked = _apply_injection_gate(
+                    conn, source_id, url, markdown, injection_decisions,
+                    auto_purge=injection_auto_purge, log=log,
+                )
+                if blocked:
+                    outcome.injection_blocked += 1
+                    injection_blocked_urls.append(url)
+                    if progress_cb:
+                        progress_cb(outcome, url)
+                    continue
+
                 existing_hash = get_existing_page_hash(conn, url)
                 if existing_hash == content_hash:
                     outcome.pages_skipped += 1
@@ -1262,7 +1428,22 @@ def sync_source(
             try:
                 markdown = re_extraction.markdown
                 assert markdown is not None
-                content_hash = hash_markdown(markdown)
+
+                content_hash, blocked = _apply_injection_gate(
+                    conn, source_id, suspect_url, markdown, injection_decisions,
+                    auto_purge=injection_auto_purge, log=log,
+                )
+                if blocked:
+                    # A JS-shell page recovered via the headless renderer is,
+                    # if anything, MORE likely to be attacker-influenced than
+                    # a static one (rendered JS output the static HTML never
+                    # showed) — the same gate applies here, not a weaker one.
+                    outcome.pages_soft_failed -= 1
+                    outcome.injection_blocked += 1
+                    injection_blocked_urls.append(suspect_url)
+                    log.info("js_render_retry_injection_blocked", url=suspect_url)
+                    continue
+
                 existing_hash = get_existing_page_hash(conn, suspect_url)
                 if existing_hash == content_hash:
                     outcome.pages_soft_failed -= 1
@@ -1364,10 +1545,39 @@ def sync_source(
             source_id,
             seen_urls,
             existing_count=pre_sync_existing_count,
-            successful_seen_count=len(seen_urls - fetch_failed_urls),
+            # Subtract injection_blocked_urls too (finding B2): a quarantined
+            # page was fetched and scored, not missing, but it's also not
+            # evidence the CRAWL ENUMERATION itself succeeded any better than
+            # if that URL had been a fetch failure — counting it toward
+            # coverage would let a sync that quarantines most of its corpus
+            # look like a healthy, complete crawl to this unrelated guard.
+            successful_seen_count=len(seen_urls - fetch_failed_urls - set(injection_blocked_urls)),
             guard_refused_out=purge_guard_refused_flag,
         )
     purge_guard_refused = bool(purge_guard_refused_flag)
+
+    # A SEPARATE pass from _delete_missing_pages above, run strictly AFTER
+    # it (finding B1): running it earlier/inline with the main loop would
+    # corrupt that guard's own existing_count/coverage-ratio snapshot, which
+    # is calibrated against the crawl's state BEFORE any of this sync's own
+    # deletions. Deliberately UNCONDITIONAL — unlike _delete_missing_pages,
+    # which is skipped on crawl_aborted_early/crawl_truncated/empty
+    # seen_urls because a page's ABSENCE from an incomplete enumeration
+    # proves nothing (finding B3): a quarantined URL is POSITIVE evidence
+    # (it was fetched, extracted, and scored this run), so an incomplete
+    # crawl enumeration doesn't weaken the case for de-indexing it.
+    injection_guard_refused_flag: list[bool] = []
+    if injection_blocked_urls:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM doc_pages WHERE source_id = %s", (source_id,))
+            (current_existing_count,) = cur.fetchone()
+        _delete_quarantined_pages(
+            conn,
+            source_id,
+            injection_blocked_urls,
+            existing_count=current_existing_count,
+            guard_refused_out=injection_guard_refused_flag,
+        )
 
     if cancel_event and cancel_event.is_set():
         outcome.status = "failed"
@@ -1393,6 +1603,7 @@ def sync_source(
         chunks_indexed=outcome.chunks_indexed,
         shell_suspected_count=outcome.shell_suspected_count,
         pages_js_rendered=outcome.pages_js_rendered,
+        injection_blocked=outcome.injection_blocked,
         crawl_truncated=crawl_truncated,
     )
     return outcome
