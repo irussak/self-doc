@@ -2814,15 +2814,9 @@ def test_sync_source_injection_enforce_shadow_records_but_does_not_block(conn, m
     assert state == "quarantined", "shadow mode must still record what WOULD have been blocked"
 
 
-def test_sync_source_auto_purge_defaults_off_until_config_supports_it(conn, monkeypatch):
-    """PR-1 scope: `SourceConfig` has no `injection_auto_purge` field yet
-    (that per-source toggle is commit 7 / PR-2 — see `_apply_injection_gate`'s
-    `getattr(source, "injection_auto_purge", False)` call). Every real
-    `SourceConfig` today must therefore always quarantine, never silently
-    auto-purge — this pins that default until the real field lands, at
-    which point this test should be replaced by one that actually sets it
-    (SourceConfig currently uses `extra="forbid"`, so a plain `setattr` for
-    an undeclared field raises `ValueError`, not silently succeeding)."""
+def test_sync_source_auto_purge_defaults_off_for_an_ordinary_source(conn, monkeypatch):
+    """A source that never set injection_auto_purge (the overwhelming common
+    case) must always quarantine, never silently auto-purge."""
     _use_fast_chunk_and_embed(monkeypatch)
     _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/evil": _POISON_MARKDOWN})
 
@@ -2837,6 +2831,26 @@ def test_sync_source_auto_purge_defaults_off_until_config_supports_it(conn, monk
         state, markdown = cur.fetchone()
     assert state == "quarantined"
     assert markdown is not None
+
+
+def test_sync_source_auto_purge_true_purges_silently_on_a_crawl_source(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+    _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/evil": _POISON_MARKDOWN})
+    cfg = SourceConfig.model_validate({
+        "name": "test-src", "base_url": "https://docs-fixture.dev/", "injection_auto_purge": True,
+    })
+
+    outcome = store.sync_source(cfg, conn)
+
+    assert outcome.injection_blocked == 1
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT state, markdown FROM doc_quarantine WHERE url = %s",
+            ("https://docs-fixture.dev/evil",),
+        )
+        state, markdown = cur.fetchone()
+    assert state == "purged"
+    assert markdown is None
 
 
 def test_sync_source_js_render_retry_scans_recovered_content(conn, monkeypatch):
@@ -2907,5 +2921,96 @@ def test_delete_quarantined_pages_ratio_guard_engages_during_sync(conn, monkeypa
         cur.execute("SELECT count(*) FROM doc_pages WHERE source_id IN (SELECT id FROM doc_sources WHERE name = 'test-src')")
         (after,) = cur.fetchone()
     assert after == 25, "the de-index ratio guard must refuse to remove the 20 pre-existing pages that got flagged"
+
+
+# --- Injection quarantine: the upload path (third hash site) ----------------
+
+
+def test_ingest_uploaded_docs_poisoned_doc_never_reaches_doc_pages(conn, monkeypatch):
+    """What breaks if this fails: uploaded content is exactly as untrusted as
+    crawled content (a zip of scraped HTML doesn't become trustworthy for
+    having been uploaded by a human), and this is the one hash site that
+    would silently bypass the whole feature if left unwired."""
+    _use_fast_chunk_and_embed(monkeypatch)
+    source = make_upload_source(conn)
+    docs = [
+        UploadedDoc(rel_path="clean.md", markdown="Alpha unique gizmo content about widgets."),
+        UploadedDoc(rel_path="evil.md", markdown=_POISON_MARKDOWN),
+    ]
+
+    outcome = store.ingest_uploaded_docs(conn, source, docs)
+
+    assert outcome.pages_fetched == 1
+    assert outcome.injection_blocked == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT url FROM doc_pages WHERE source_id = %s", (source.id,))
+        urls = {r[0] for r in cur.fetchall()}
+    assert urls == {f"upload://{source.name}/clean.md"}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT state FROM doc_quarantine WHERE url = %s",
+            (f"upload://{source.name}/evil.md",),
+        )
+        (state,) = cur.fetchone()
+    assert state == "quarantined"
+
+
+def test_ingest_uploaded_docs_deindexes_a_doc_that_becomes_poisoned_on_reupload(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+    source = make_upload_source(conn)
+    url = f"upload://{source.name}/doc.md"
+
+    store.ingest_uploaded_docs(conn, source, [UploadedDoc(rel_path="doc.md", markdown="originally clean content")])
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM doc_pages WHERE url = %s", (url,))
+        assert cur.fetchone() is not None
+
+    outcome = store.ingest_uploaded_docs(conn, source, [UploadedDoc(rel_path="doc.md", markdown=_POISON_MARKDOWN)])
+
+    assert outcome.injection_blocked == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM doc_pages WHERE url = %s", (url,))
+        assert cur.fetchone() is None, "a re-uploaded doc that becomes poisoned must be de-indexed"
+
+
+def test_ingest_uploaded_docs_resubmitting_unchanged_poisoned_doc_does_not_duplicate(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+    source = make_upload_source(conn)
+    docs = [UploadedDoc(rel_path="evil.md", markdown=_POISON_MARKDOWN)]
+
+    store.ingest_uploaded_docs(conn, source, docs)
+    store.ingest_uploaded_docs(conn, source, docs)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM doc_quarantine WHERE url = %s",
+            (f"upload://{source.name}/evil.md",),
+        )
+        (count,) = cur.fetchone()
+    assert count == 1
+
+
+def test_ingest_uploaded_docs_auto_purge_source_purges_silently(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+    cfg = SourceConfig.model_validate({
+        "name": "test-upload-src", "source_type": "upload", "base_url": "upload://test-upload-src",
+        "injection_auto_purge": True,
+    })
+    source_id = sources_repo.create_source(conn, cfg)
+    source = sources_repo.get_source(conn, source_id)
+    assert source is not None
+    assert source.injection_auto_purge is True
+
+    outcome = store.ingest_uploaded_docs(conn, source, [UploadedDoc(rel_path="evil.md", markdown=_POISON_MARKDOWN)])
+
+    assert outcome.injection_blocked == 1
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT state, markdown FROM doc_quarantine WHERE url = %s",
+            (f"upload://{source.name}/evil.md",),
+        )
+        state, markdown = cur.fetchone()
+    assert state == "purged"
+    assert markdown is None
 
 

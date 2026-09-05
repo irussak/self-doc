@@ -1716,6 +1716,15 @@ def ingest_uploaded_docs(
     at a crawl source; use `sync_source`/`sync_source_with_metrics` for
     those.
 
+    Each doc's markdown passes through `_apply_injection_gate` before the
+    existing-hash skip, same as the two crawl-path hash sites in
+    `sync_source` — uploaded content is exactly as untrusted as crawled
+    content (a zip of scraped HTML is no more trustworthy for having been
+    uploaded by a human rather than fetched by the crawler). A flagged doc
+    is deleted from `doc_pages` directly (no ratio guard — see the inline
+    comment at the call site for why one crawl-shaped guard doesn't apply
+    to a single re-flagged upload) and counted in `outcome.injection_blocked`.
+
     Deliberately NEVER calls `_delete_missing_pages`: unlike a crawl, one
     upload batch is never a complete enumeration of the source's pages (a
     user can upload a handful of files at a time, across many separate
@@ -1745,11 +1754,36 @@ def ingest_uploaded_docs(
     start = time.monotonic()
     outcome = SourceOutcome(name=source.name)
     log = logger.bind(source=source.name)
+    # Preloaded once per batch call, mirroring sync_source's preload — see
+    # _apply_injection_gate's docstring for the (url, content_hash)
+    # decision-memory semantics.
+    injection_decisions = load_injection_decisions(conn, source.id)
 
     for doc in docs:
         url = f"upload://{source.name}/{doc.rel_path}"
         try:
-            content_hash = hash_markdown(doc.markdown)
+            content_hash, blocked = _apply_injection_gate(
+                conn, source.id, url, doc.markdown, injection_decisions,
+                auto_purge=source.injection_auto_purge, log=log,
+            )
+            if blocked:
+                # Direct per-doc delete, no ratio guard: unlike a crawl,
+                # ingest_uploaded_docs never calls _delete_missing_pages
+                # (one upload batch is never a complete enumeration of the
+                # source — see this function's own docstring), so there is
+                # no equivalent bulk-deletion path here to guard. A single
+                # doc being re-flagged is not the mass-wipe risk the ratio
+                # guard exists for.
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM doc_pages WHERE url = %s", (url,))
+                if not conn.autocommit:
+                    conn.commit()
+                outcome.injection_blocked += 1
+                log.warning("upload_doc_injection_blocked", url=url)
+                if progress_cb:
+                    progress_cb(outcome, url)
+                continue
+
             existing_hash = get_existing_page_hash(conn, url)
             if existing_hash == content_hash:
                 outcome.pages_skipped += 1
@@ -1794,6 +1828,7 @@ def ingest_uploaded_docs(
         pages_skipped=outcome.pages_skipped,
         pages_failed=outcome.pages_failed,
         chunks_indexed=outcome.chunks_indexed,
+        injection_blocked=outcome.injection_blocked,
     )
     return outcome
 
