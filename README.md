@@ -260,7 +260,7 @@ services expect. They are the only files you need from this repo:
 ```bash
 mkdir -p self-docs/db/init && cd self-docs
 base=https://raw.githubusercontent.com/AdamRussak/self-doc/main/db/init
-for f in 01_schema.sql 02_sources_config.sql 03_fix_embedding_dim.sql 04_upload_sources.sql; do
+for f in 01_schema.sql 02_sources_config.sql 03_fix_embedding_dim.sql 04_upload_sources.sql 05_injection_quarantine.sql; do
   curl -fsSL "$base/$f" -o "db/init/$f"
 done
 ```
