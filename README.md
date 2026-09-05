@@ -500,9 +500,9 @@ make sync                               # trigger the initial documentation sync
 | Guide | What's inside |
 |-------|---------------|
 | **[Client Setup](docs/client-setup.md)** | Connect Cursor, Claude Code, and Antigravity |
-| **[Runbook](docs/runbook.md)** | DB migration, [adding sources](docs/runbook.md#add-a-new-doc-source), [upload sources](docs/runbook.md#upload-sources), [pre-built images & tag scheme](docs/runbook.md#pre-built-container-images-ghcr), scheduler, backup/restore, troubleshooting |
+| **[Runbook](docs/runbook.md)** | DB migration, [adding sources](docs/runbook.md#add-a-new-doc-source), [upload sources](docs/runbook.md#upload-sources), [injection quarantine](docs/runbook.md#injection-quarantine--reviewing-flagged-pages), [pre-built images & tag scheme](docs/runbook.md#pre-built-container-images-ghcr), scheduler, backup/restore, troubleshooting |
 | **[Deploy Kit](deploy/README.md)** | Reference for `deploy/install.sh` — file manifest, full flag list, and exit codes for the standalone image-based install kit |
-| **[Architecture Decisions](docs/adr/)** | ADRs documenting key design choices, including [ADR-005: Uploads as a Source Type](docs/adr/005-document-uploads-as-a-source-type.md). |
+| **[Architecture Decisions](docs/adr/)** | ADRs documenting key design choices, including [ADR-005: Uploads as a Source Type](docs/adr/005-document-uploads-as-a-source-type.md) and [ADR-007: Quarantine Untrusted Doc Content](docs/adr/007-quarantine-untrusted-doc-content.md). |
 
 ## Development
 
