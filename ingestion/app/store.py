@@ -486,6 +486,291 @@ def set_llms_validators(
         conn.commit()
 
 
+# --- Injection quarantine: decision memory + review-queue data layer ------
+#
+# A flagged page's content NEVER enters doc_pages/doc_chunks — it is held
+# here instead, reviewed via the admin UI's Allow/Purge actions. See
+# db/init/05_injection_quarantine.sql for the schema and why there is
+# deliberately no foreign key to doc_pages.
+#
+# Refuses to de-index more than this fraction of a source's EXISTING pages
+# in one sync (mirroring the shape of PURGE_DELETE_RATIO_THRESHOLD above,
+# but for a brand-new destructive path this feature adds: nothing before
+# this guarded a mass quarantine-and-deindex the way the purge-ratio guard
+# already protects `_delete_missing_pages`). Deliberately asymmetric with
+# that guard: refusing to REMOVE content here is always safe and reversible
+# (the pages stay served until the next sync); refusing to ADD is not the
+# risk this guard is for, so there is no companion "low coverage" condition
+# — a single sync flagging most of a source's corpus is suspicious enough
+# on its own to warrant a human look before any of it is de-indexed.
+INJECTION_DEINDEX_RATIO_CEILING = 0.5
+
+
+def load_injection_decisions(conn: psycopg.Connection, source_id: int) -> dict[tuple[str, str], str]:
+    """Return `{(url, content_hash): state}` for every `doc_quarantine` row
+    of `source_id`, preloaded once per sync (mirroring `load_page_validators`)
+    so the per-page decision lookup inside `sync_source`'s main loop costs no
+    additional query. A page whose `(url, content_hash)` isn't a key here has
+    never been scanned, or was scanned under a content hash that has since
+    changed upstream — either way it must be scanned fresh."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, content_hash, state FROM doc_quarantine WHERE source_id = %s",
+            (source_id,),
+        )
+        rows = cur.fetchall()
+    return {(url, content_hash): state for url, content_hash, state in rows}
+
+
+def record_injection_detection(
+    conn: psycopg.Connection,
+    source_id: int,
+    url: str,
+    content_hash: str,
+    *,
+    score: int,
+    rule_ids: list[str],
+    evidence: str,
+    markdown: str | None,
+    state: str,
+) -> None:
+    """Upsert a `doc_quarantine` row for a freshly-flagged `(url,
+    content_hash)`. `ON CONFLICT` bumps `last_seen_at` on a re-detection of
+    content that was already recorded — this is what stops a naive
+    re-scan-every-sync design from either duplicating rows or (if a prior
+    sync's row were deleted instead of upserted) re-queuing the same content
+    for human review forever.
+
+    `state` is `'quarantined'` (the normal path — held for human review) or
+    `'purged'` directly (the source has `injection_auto_purge` enabled: no
+    review, no notification, silent drop — the precise meaning of "the
+    source owner pre-granted permission"). `markdown` should be `None`
+    exactly when `state == 'purged'` — the tombstone drops the retained
+    payload on purpose (see the schema's `state` column comment).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO doc_quarantine
+                (source_id, url, content_hash, markdown, score, rule_ids, evidence, state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url, content_hash) DO UPDATE SET last_seen_at = now()
+            """,
+            (source_id, url, content_hash, markdown, score, rule_ids, evidence, state),
+        )
+    if not conn.autocommit:
+        conn.commit()
+
+
+@dataclass(frozen=True)
+class QuarantineRecord:
+    id: int
+    source_id: int
+    url: str
+    content_hash: str
+    markdown: str | None
+    score: int
+    rule_ids: list[str]
+    evidence: str | None
+    state: str
+    detected_at: datetime
+    last_seen_at: datetime
+    decided_at: datetime | None
+    decided_by: str | None
+
+
+def _row_to_quarantine_record(row: tuple) -> QuarantineRecord:
+    (
+        id_, source_id, url, content_hash, markdown, score, rule_ids,
+        evidence, state, detected_at, last_seen_at, decided_at, decided_by,
+    ) = row
+    return QuarantineRecord(
+        id=id_,
+        source_id=source_id,
+        url=url,
+        content_hash=content_hash,
+        markdown=markdown,
+        score=score,
+        rule_ids=list(rule_ids or []),
+        evidence=evidence,
+        state=state,
+        detected_at=detected_at,
+        last_seen_at=last_seen_at,
+        decided_at=decided_at,
+        decided_by=decided_by,
+    )
+
+
+_QUARANTINE_SELECT_COLUMNS = (
+    "id, source_id, url, content_hash, markdown, score, rule_ids, "
+    "evidence, state, detected_at, last_seen_at, decided_at, decided_by"
+)
+
+
+def list_quarantine(
+    conn: psycopg.Connection,
+    *,
+    source_id: int | None = None,
+    state: str | None = "quarantined",
+    limit: int = 200,
+) -> list[QuarantineRecord]:
+    """List `doc_quarantine` rows, most recently detected first. `state`
+    defaults to `'quarantined'` (the review queue's normal view — pass
+    `None` to include allowed/purged rows too, e.g. for an audit view)."""
+    clauses: list[str] = []
+    params: list[object] = []
+    if source_id is not None:
+        clauses.append("source_id = %s")
+        params.append(source_id)
+    if state is not None:
+        clauses.append("state = %s")
+        params.append(state)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_QUARANTINE_SELECT_COLUMNS} FROM doc_quarantine {where} "
+            f"ORDER BY detected_at DESC LIMIT %s",
+            params,
+        )
+        rows = cur.fetchall()
+    return [_row_to_quarantine_record(row) for row in rows]
+
+
+def get_quarantine_entry(conn: psycopg.Connection, quarantine_id: int) -> QuarantineRecord | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_QUARANTINE_SELECT_COLUMNS} FROM doc_quarantine WHERE id = %s",
+            (quarantine_id,),
+        )
+        row = cur.fetchone()
+    return _row_to_quarantine_record(row) if row else None
+
+
+def count_quarantine_pending(conn: psycopg.Connection, source_id: int | None = None) -> int:
+    with conn.cursor() as cur:
+        if source_id is None:
+            cur.execute("SELECT count(*) FROM doc_quarantine WHERE state = 'quarantined'")
+        else:
+            cur.execute(
+                "SELECT count(*) FROM doc_quarantine WHERE state = 'quarantined' AND source_id = %s",
+                (source_id,),
+            )
+        (count,) = cur.fetchone()
+    return count
+
+
+def set_injection_decision(
+    conn: psycopg.Connection, quarantine_id: int, state: str, *, decided_by: str | None = None
+) -> None:
+    """Record a human (or automated auto-purge) decision on a quarantine
+    row. `state='purged'` also NULLs `markdown` — see the schema's tombstone
+    comment for why the row itself is kept rather than deleted."""
+    with conn.cursor() as cur:
+        if state == "purged":
+            cur.execute(
+                "UPDATE doc_quarantine SET state = %s, markdown = NULL, decided_at = now(), decided_by = %s "
+                "WHERE id = %s",
+                (state, decided_by, quarantine_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE doc_quarantine SET state = %s, decided_at = now(), decided_by = %s WHERE id = %s",
+                (state, decided_by, quarantine_id),
+            )
+    if not conn.autocommit:
+        conn.commit()
+
+
+def index_quarantined_page(conn: psycopg.Connection, quarantine_id: int) -> int:
+    """The "Allow" mechanics: chunk/embed/index a quarantine row's stored
+    markdown IMMEDIATELY, rather than waiting for the page to be re-crawled
+    on the next scheduled sync (which may be a day away, and which would
+    re-fetch content that could differ from what a human just reviewed and
+    approved). No etag/last_modified is persisted — mirroring the same
+    choice already made for the js_render-retry path in `sync_source`: this
+    content did not come from an HTTP response in THIS call, so there is no
+    real validator to attach. The next real sync refetches in full, rescans,
+    finds the `'allowed'` decision for the (by-then-likely-unchanged) hash,
+    and hash-skips — self-consistent.
+
+    Raises `ValueError` if the entry doesn't exist or has no retained
+    markdown (already purged, or never had any — defensive; the caller,
+    the admin Allow route, should never reach this state).
+
+    Returns the number of chunks indexed.
+    """
+    entry = get_quarantine_entry(conn, quarantine_id)
+    if entry is None:
+        raise ValueError(f"no quarantine entry with id={quarantine_id}")
+    if entry.markdown is None:
+        raise ValueError(f"quarantine entry {quarantine_id} has no retained content to index (state={entry.state!r})")
+
+    chunks = chunker.chunk_markdown(entry.url, entry.markdown)
+    chunks = embedder.embed_chunks(chunks)
+    n = replace_page(conn, entry.source_id, entry.url, entry.content_hash, chunks)
+    set_injection_decision(conn, quarantine_id, "allowed")
+    logger.info("injection_quarantine_allowed", url=entry.url, quarantine_id=quarantine_id, chunks=n)
+    return n
+
+
+def _delete_quarantined_pages(
+    conn: psycopg.Connection,
+    source_id: int,
+    blocked_urls: list[str],
+    *,
+    existing_count: int,
+    guard_refused_out: list[bool] | None = None,
+) -> int:
+    """Delete `doc_pages` rows for every URL in `blocked_urls` (pages that
+    were previously indexed but have just been flagged this sync) — a
+    SEPARATE pass from `_delete_missing_pages`, run strictly AFTER it (see
+    `sync_source`'s integration): running concurrently with the main loop
+    would corrupt `_delete_missing_pages`'s own pre-computed
+    `existing_count`/coverage-ratio guard, since that guard is calibrated
+    against a snapshot taken BEFORE any of this sync's deletions.
+
+    Guarded the same way `_delete_missing_pages` is guarded against a mass
+    wipe, but for THIS newly-added destructive path specifically — nothing
+    before this feature bounded how many pages a single sync could
+    quarantine-and-deindex, and a bad pattern in a ruleset update should not
+    be able to silently gut a source in one run. Refusing the DELETE here
+    does not un-flag the pages: they stay out of the index (never indexed
+    in the first place, by construction — see `sync_source`), only the
+    removal of any PRE-EXISTING `doc_pages` rows for them is what's refused.
+    """
+    if not blocked_urls or existing_count == 0:
+        return 0
+
+    if existing_count >= PURGE_RATIO_GUARD_MIN_EXISTING_PAGES:
+        blocked_ratio = len(blocked_urls) / existing_count
+        if blocked_ratio > INJECTION_DEINDEX_RATIO_CEILING:
+            logger.warning(
+                "delete_quarantined_pages_ratio_guard_refused",
+                source_id=source_id,
+                existing_count=existing_count,
+                blocked_count=len(blocked_urls),
+                blocked_ratio=round(blocked_ratio, 3),
+                ratio_ceiling=INJECTION_DEINDEX_RATIO_CEILING,
+                hint="an unusually large fraction of this source was flagged in one "
+                "sync — review ingestion_rules.yaml and the admin quarantine queue "
+                "before assuming this is a false-positive spike",
+            )
+            if guard_refused_out is not None:
+                guard_refused_out.append(True)
+            return 0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM doc_pages WHERE source_id = %s AND url = ANY(%s)",
+            (source_id, blocked_urls),
+        )
+        removed = cur.rowcount
+    if not conn.autocommit:
+        conn.commit()
+    return removed
+
+
 def _delete_missing_pages(
     conn: psycopg.Connection,
     source_id: int,
@@ -1526,6 +1811,15 @@ def purge_source(conn: psycopg.Connection, source_id: int) -> int:
     """Delete all doc_pages (cascading to doc_chunks) for source_id,
     reset last_synced/last_status/llms validators to NULL.
     Returns the number of pages deleted.
+
+    Deliberately does NOT touch `doc_quarantine`. A quarantine decision is a
+    judgment about CONTENT (is this page's text an injection attempt), not
+    about index state — re-reviewing every previously-flagged page after
+    every purge would be exactly the review-queue churn the
+    upsert-on-re-detection design in `record_injection_detection` exists to
+    prevent. The next sync re-populates `doc_pages` from scratch and consults
+    the surviving `(url, content_hash)` decisions exactly as it would have
+    without the purge.
     """
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM doc_pages WHERE source_id = %s", (source_id,))

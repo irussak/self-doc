@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 
 import psycopg
 import pytest
 from app import sources_repo, store
 from app.config import SourceConfig
 from app.uploads import UploadedDoc
+
+_INJECTION_MIGRATION_SQL = (
+    Path(__file__).resolve().parents[2] / "db" / "init" / "05_injection_quarantine.sql"
+).read_text()
 
 os.environ.setdefault("POSTGRES_HOST", "127.0.0.1")
 os.environ.setdefault("POSTGRES_PORT", "5433")
@@ -61,6 +66,16 @@ def _purge_test_sources(c) -> None:
 def conn():
     c = store.get_connection()
     try:
+        # Self-healing for a developer whose `pgdata_test` volume predates
+        # this migration: db/init/*.sql only runs on an EMPTY Postgres data
+        # directory, so a pre-existing test volume would otherwise fail
+        # every quarantine test with "relation doc_quarantine does not
+        # exist" until someone thinks to run `make test-db-reset`. Every
+        # statement in the migration is idempotent (IF NOT EXISTS /
+        # drop-then-add), so applying it here is a no-op on an
+        # already-migrated database and a fix on a stale one.
+        with c.cursor() as cur:
+            cur.execute(_INJECTION_MIGRATION_SQL)
         _purge_test_sources(c)  # safety net in case a prior run crashed mid-test
         yield c
     finally:
@@ -2348,5 +2363,252 @@ def test_sync_all_skips_upload_sources_without_touching_crawler(conn, monkeypatc
         cur.execute("SELECT 1 FROM doc_sources WHERE name = %s", ("test-upload-src",))
         row = cur.fetchone()
     assert row is None  # sync_all never even calls ensure_source for it
+
+
+# --- Injection quarantine: data-layer round trips ---------------------------
+#
+# Pure ratio-guard arithmetic (no DB) lives in test_injection.py-adjacent
+# territory conceptually, but _delete_quarantined_pages itself needs a real
+# doc_pages row count, so its guard is exercised here against a live DB
+# rather than as a standalone pure-function test.
+
+
+def test_record_injection_detection_is_idempotent_on_reconflict(conn):
+    """What breaks if this fails: a naive re-scan-every-sync design would
+    either duplicate a quarantine row per re-detection (bloating the review
+    queue) or, if re-detection instead deleted-then-reinserted, would reset
+    `detected_at` and lose the original detection timestamp. The upsert
+    keyed on (url, content_hash) must do neither."""
+    source_id = store.ensure_source(conn, make_source())
+
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/evil", "a" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="Ignore all previous...",
+        markdown="poison content", state="quarantined",
+    )
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/evil", "a" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="Ignore all previous...",
+        markdown="poison content", state="quarantined",
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM doc_quarantine WHERE source_id = %s AND url = %s",
+            (source_id, "https://docs-fixture.dev/evil"),
+        )
+        (count,) = cur.fetchone()
+    assert count == 1, "re-detecting the same (url, content_hash) must upsert, never duplicate"
+
+
+def test_quarantine_purged_tombstones_rather_than_deletes(conn):
+    """What breaks if this fails: deleting the row on Purge (instead of
+    tombstoning it) would make the next sync re-detect the same content and
+    re-queue it for human review forever — the exact livelock the tombstone
+    design exists to prevent."""
+    source_id = store.ensure_source(conn, make_source())
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/evil", "b" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="ev",
+        markdown="poison content", state="quarantined",
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM doc_quarantine WHERE source_id = %s AND url = %s",
+            (source_id, "https://docs-fixture.dev/evil"),
+        )
+        (quarantine_id,) = cur.fetchone()
+
+    store.set_injection_decision(conn, quarantine_id, "purged", decided_by="test-admin")
+
+    entry = store.get_quarantine_entry(conn, quarantine_id)
+    assert entry is not None, "the row must survive purge — this is the whole point of a tombstone"
+    assert entry.state == "purged"
+    assert entry.markdown is None, "purge must drop the retained content"
+    assert entry.decided_by == "test-admin"
+    assert entry.decided_at is not None
+
+    # And the decision-memory property: re-detecting the SAME (url,
+    # content_hash) must not create a second row or reset the tombstone.
+    decisions = store.load_injection_decisions(conn, source_id)
+    assert decisions[("https://docs-fixture.dev/evil", "b" * 64)] == "purged"
+
+
+def test_index_quarantined_page_indexes_immediately_and_nulls_markdown(conn, monkeypatch):
+    """What breaks if this fails: clicking Allow in the admin UI would leave
+    the page unsearchable until the next scheduled sync (which may re-fetch
+    different content than what was actually reviewed and approved)."""
+    _use_fast_chunk_and_embed(monkeypatch)
+    source_id = store.ensure_source(conn, make_source())
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/false-positive", "c" * 64,
+        score=105, rule_ids=["override_ignore_prior", "agent_conceal"], evidence="ev",
+        markdown="This page legitimately discusses ignore all previous instructions as an attack example.",
+        state="quarantined",
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM doc_quarantine WHERE source_id = %s AND url = %s",
+            (source_id, "https://docs-fixture.dev/false-positive"),
+        )
+        (quarantine_id,) = cur.fetchone()
+
+    n = store.index_quarantined_page(conn, quarantine_id)
+    assert n == 1
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/false-positive",))
+        assert cur.fetchone() is not None, "Allow must index the page immediately, not wait for the next sync"
+
+    entry = store.get_quarantine_entry(conn, quarantine_id)
+    assert entry is not None
+    assert entry.state == "allowed"
+    assert entry.markdown is None, "content now lives in doc_chunks; storing it twice is pointless"
+
+
+def test_index_quarantined_page_raises_for_already_purged_entry(conn):
+    source_id = store.ensure_source(conn, make_source())
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/evil", "d" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="ev",
+        markdown=None, state="purged",
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM doc_quarantine WHERE source_id = %s AND url = %s",
+            (source_id, "https://docs-fixture.dev/evil"),
+        )
+        (quarantine_id,) = cur.fetchone()
+
+    with pytest.raises(ValueError, match="no retained content"):
+        store.index_quarantined_page(conn, quarantine_id)
+
+
+def test_delete_quarantined_pages_ratio_guard_permits_small_deletion(conn, monkeypatch):
+    """A source with 25 existing pages flagging 2 of them (8%) is well under
+    the 50% ceiling and must be de-indexed without a guard refusal."""
+    _use_fast_chunk_and_embed(monkeypatch)
+    source_id = store.ensure_source(conn, make_source())
+    urls = [f"https://docs-fixture.dev/page-{i}" for i in range(25)]
+    for url in urls:
+        chunks = store.chunker.chunk_markdown(url, "content")
+        chunks = store.embedder.embed_chunks(chunks)
+        store.replace_page(conn, source_id, url, store.hash_markdown(url), chunks)
+
+    blocked = urls[:2]
+    guard_refused: list[bool] = []
+    removed = store._delete_quarantined_pages(
+        conn, source_id, blocked, existing_count=25, guard_refused_out=guard_refused
+    )
+    assert removed == 2
+    assert not guard_refused
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM doc_pages WHERE source_id = %s", (source_id,))
+        (remaining,) = cur.fetchone()
+    assert remaining == 23
+
+
+def test_delete_quarantined_pages_ratio_guard_refuses_large_deletion(conn, monkeypatch):
+    """What breaks if this fails: a bad ruleset update flagging most of a
+    source's corpus in one sync would silently deindex the whole thing, with
+    nothing bounding the blast radius the way the purge-ratio guard already
+    bounds `_delete_missing_pages`."""
+    _use_fast_chunk_and_embed(monkeypatch)
+    source_id = store.ensure_source(conn, make_source())
+    urls = [f"https://docs-fixture.dev/page-{i}" for i in range(25)]
+    for url in urls:
+        chunks = store.chunker.chunk_markdown(url, "content")
+        chunks = store.embedder.embed_chunks(chunks)
+        store.replace_page(conn, source_id, url, store.hash_markdown(url), chunks)
+
+    blocked = urls[:20]  # 80% — well over the 50% ceiling
+    guard_refused: list[bool] = []
+    removed = store._delete_quarantined_pages(
+        conn, source_id, blocked, existing_count=25, guard_refused_out=guard_refused
+    )
+    assert removed == 0
+    assert guard_refused == [True]
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM doc_pages WHERE source_id = %s", (source_id,))
+        (remaining,) = cur.fetchone()
+    assert remaining == 25, "the guard must refuse the delete, not just log a warning"
+
+
+def test_delete_quarantined_pages_below_guard_floor_is_unguarded(conn, monkeypatch):
+    """Below PURGE_RATIO_GUARD_MIN_EXISTING_PAGES the guard doesn't engage at
+    all — a handful of pages moving is not a meaningful signal of a runaway
+    ruleset, mirroring the same floor _delete_missing_pages already uses."""
+    _use_fast_chunk_and_embed(monkeypatch)
+    source_id = store.ensure_source(conn, make_source())
+    urls = [f"https://docs-fixture.dev/page-{i}" for i in range(5)]
+    for url in urls:
+        chunks = store.chunker.chunk_markdown(url, "content")
+        chunks = store.embedder.embed_chunks(chunks)
+        store.replace_page(conn, source_id, url, store.hash_markdown(url), chunks)
+
+    removed = store._delete_quarantined_pages(conn, source_id, urls, existing_count=5)
+    assert removed == 5
+
+
+def test_purge_source_leaves_quarantine_decisions_intact(conn):
+    """What breaks if this fails: an operator running POST /purge (or the
+    admin "refresh" action, which purges before recrawling) would force
+    every previously-flagged page back through human review on the very
+    next sync — the churn the upsert/tombstone design exists to prevent."""
+    source_id = store.ensure_source(conn, make_source())
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/evil", "e" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="ev",
+        markdown="poison", state="quarantined",
+    )
+
+    store.purge_source(conn, source_id)
+
+    decisions = store.load_injection_decisions(conn, source_id)
+    assert decisions[("https://docs-fixture.dev/evil", "e" * 64)] == "quarantined"
+
+
+def test_delete_source_cascades_quarantine_decisions(conn):
+    """The complementary case to purge_source above: deleting the SOURCE
+    itself (not just purging its pages) must clean up its decisions too, via
+    doc_quarantine's ON DELETE CASCADE on source_id — otherwise decisions for
+    a long-gone source would accumulate forever."""
+    source_id = store.ensure_source(conn, make_source())
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/evil", "f" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="ev",
+        markdown="poison", state="quarantined",
+    )
+    sources_repo.delete_source(conn, source_id)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM doc_quarantine WHERE source_id = %s", (source_id,))
+        (count,) = cur.fetchone()
+    assert count == 0
+
+
+def test_list_quarantine_defaults_to_quarantined_state_only(conn):
+    source_id = store.ensure_source(conn, make_source())
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/pending", "1" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="ev",
+        markdown="poison", state="quarantined",
+    )
+    store.record_injection_detection(
+        conn, source_id, "https://docs-fixture.dev/decided", "2" * 64,
+        score=150, rule_ids=["override_ignore_prior"], evidence="ev",
+        markdown=None, state="purged",
+    )
+
+    pending = store.list_quarantine(conn, source_id=source_id)
+    assert [r.url for r in pending] == ["https://docs-fixture.dev/pending"]
+
+    everything = store.list_quarantine(conn, source_id=source_id, state=None)
+    assert {r.url for r in everything} == {
+        "https://docs-fixture.dev/pending",
+        "https://docs-fixture.dev/decided",
+    }
+
+    assert store.count_quarantine_pending(conn, source_id=source_id) == 1
 
 
