@@ -846,6 +846,23 @@ def test_quarantine_list_view_renders_pending_entries(client, monkeypatch):
     assert "widget.example.com/docs/evil" in resp.text
 
 
+def test_quarantine_list_view_nav_badge_uses_global_count_not_len_entries(client, monkeypatch):
+    """Regression: the nav badge previously used `len(entries)` — the
+    per-page, source-filtered, 200-capped list — instead of the true global
+    pending count. A source_id filter narrowing the visible list to 1 entry
+    must not shrink the shared nav badge (rendered on every admin page) to
+    match; it must keep showing the real total."""
+    _login(client)
+    monkeypatch.setattr(admin.store, "list_quarantine", MagicMock(return_value=[_make_quarantine_entry()]))
+    monkeypatch.setattr(admin.sources_repo, "list_sources", MagicMock(return_value=[]))
+    monkeypatch.setattr(admin.store, "count_quarantine_pending", MagicMock(return_value=47))
+
+    resp = client.get("/admin/quarantine?source_id=1")
+
+    assert resp.status_code == 200
+    assert "Quarantine (47)" in resp.text
+
+
 def test_allow_quarantine_indexes_and_redirects(client, csrf_token, monkeypatch):
     _login(client)
     entry = _make_quarantine_entry()
@@ -857,7 +874,7 @@ def test_allow_quarantine_indexes_and_redirects(client, csrf_token, monkeypatch)
 
     assert resp.status_code == 303
     assert "allowed" in resp.headers["location"]
-    index_mock.assert_called_once_with(index_mock.call_args.args[0], 7)
+    index_mock.assert_called_once_with(index_mock.call_args.args[0], 7, decided_by="admin")
     assert not admin._manual_sync_lock.locked(), "the lock must be released after Allow completes"
 
 
@@ -919,7 +936,7 @@ def test_purge_quarantine_tombstones_and_redirects(client, csrf_token, monkeypat
     assert resp.status_code == 303
     assert "purged" in resp.headers["location"]
     assert "level=warning" not in resp.headers["location"]
-    decision_mock.assert_called_once_with(decision_mock.call_args.args[0], 7, "purged")
+    decision_mock.assert_called_once_with(decision_mock.call_args.args[0], 7, "purged", decided_by="admin")
 
 
 def test_purge_quarantine_not_found_returns_404(client, csrf_token, monkeypatch):

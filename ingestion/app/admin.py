@@ -2016,7 +2016,14 @@ def list_quarantine_view(
             "sources": sources,
             "selected_source_id": source_id,
             "badge_class": _quarantine_badge_class,
-            "quarantine_pending_count": len(entries),
+            # Global, unfiltered count — matches list_sources_view's call
+            # (line ~893) exactly. `len(entries)` would have undercounted
+            # past the `limit=200` cap and, worse, changed value depending
+            # on the `source_id` filter currently applied to THIS page's own
+            # list, even though the nav badge is a shared element rendered
+            # identically on every admin page (base.html) — a per-source
+            # count doesn't belong on a page-independent badge.
+            "quarantine_pending_count": store.count_quarantine_pending(conn),
             "csrf_token": _expected_csrf_token(),
             "message": request.query_params.get("msg"),
             "message_level": _message_level(request),
@@ -2054,7 +2061,12 @@ def allow_quarantine_submit(
             status_code=409,
         )
     try:
-        store.index_quarantined_page(conn, quarantine_id)
+        # "admin": this codebase's admin auth is a single shared session
+        # (SYNC_TOKEN login, no per-user identity — see require_session),
+        # so "admin" is the most specific truthful attribution available;
+        # it still distinguishes a human-reviewed decision from NULL
+        # (auto-purge, or never decided) in the audit column.
+        store.index_quarantined_page(conn, quarantine_id, decided_by="admin")
         if hasattr(conn, "commit"):
             conn.commit()
     except ValueError as e:
@@ -2090,7 +2102,8 @@ def purge_quarantine_submit(
     if entry is None:
         raise HTTPException(status_code=404, detail="quarantine entry not found")
 
-    store.set_injection_decision(conn, quarantine_id, "purged")
+    # "admin": see allow_quarantine_submit's identical comment above.
+    store.set_injection_decision(conn, quarantine_id, "purged", decided_by="admin")
     if hasattr(conn, "commit"):
         conn.commit()
     logger.info("admin_quarantine_purged", quarantine_id=quarantine_id, url=entry.url)

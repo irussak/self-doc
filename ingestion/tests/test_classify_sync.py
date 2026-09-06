@@ -4,7 +4,7 @@ conditional chain responsible for the 2026-07-26 sync-health incident (see
 `test_sync_health.py` for the full incident-shaped regression scenarios and
 `store.py`'s module docstring above `SOFT_FAIL_PARTIAL_RATIO` for the root
 cause). These tests require no database — `classify_sync` is a pure function
-of a `SourceOutcome` plus two booleans.
+of a `SourceOutcome` plus a handful of out-of-band booleans.
 
 The table below exercises every branch of `classify_sync`'s documented rule
 order, not just the three sync-health incident scenarios:
@@ -12,6 +12,7 @@ order, not just the three sync-health incident scenarios:
   1. cancelled by user                              -> failed
   2. nothing indexed or confirmed this run           -> failed
   3. purge_guard_refused                             -> partial
+  3b. injection_guard_refused                        -> partial
   4. crawl_aborted_early                             -> partial
   5. pages_failed > 0                                -> partial
   6. soft-fail ratio > SOFT_FAIL_PARTIAL_RATIO        -> partial
@@ -100,6 +101,30 @@ def test_purge_guard_refused_is_partial_despite_zero_hard_failures():
 def test_purge_guard_refused_outranks_soft_fail_ratio_being_fine():
     outcome = _outcome(pages_fetched=100, pages_soft_failed=0)
     assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=True) == "partial"
+
+
+# --- Rule 3b: injection_guard_refused. A separate parameter from
+# purge_guard_refused (not folded into it) so an operator debugging a
+# "partial" status can tell "the missing-page purge guard refused" apart
+# from "the injection de-index guard refused" — same reasoning as keeping
+# crawl_truncated separate from crawl_aborted_early below. Regression guard
+# for `_delete_quarantined_pages`'s own ratio ceiling being silently ignored
+# by classify_sync (the flag was computed but never passed through).
+def test_injection_guard_refused_is_partial_despite_zero_hard_failures():
+    outcome = _outcome(pages_fetched=1)
+    assert classify_sync(outcome, purge_guard_refused=False, injection_guard_refused=True) == "partial"
+
+
+def test_injection_guard_refused_outranks_soft_fail_ratio_being_fine():
+    outcome = _outcome(pages_fetched=100, pages_soft_failed=0)
+    assert classify_sync(outcome, purge_guard_refused=False, injection_guard_refused=True) == "partial"
+
+
+def test_injection_guard_refused_defaults_to_false():
+    """The default must never silently turn an ordinary sync into partial —
+    every existing call site that doesn't pass this kwarg must be unaffected."""
+    outcome = _outcome(pages_fetched=5)
+    assert classify_sync(outcome) == "ok"
 
 
 # --- Rule 4: crawl_aborted_early.

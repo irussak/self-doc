@@ -311,6 +311,7 @@ def classify_sync(
     *,
     crawl_aborted_early: bool = False,
     purge_guard_refused: bool = False,
+    injection_guard_refused: bool = False,
     crawl_truncated: bool = False,
 ) -> str:
     """Classify one sync attempt's final `outcome` into `ok` / `partial` /
@@ -330,6 +331,14 @@ def classify_sync(
       partial - `purge_guard_refused` (the purge-ratio guard declining to
                 delete anything is itself an incident worth surfacing, even
                 though the pages it protected are still intact)
+      partial - `injection_guard_refused` (same shape of event as
+                `purge_guard_refused` above, but for `_delete_quarantined_pages`'s
+                own de-index ratio ceiling — kept as ITS OWN parameter rather
+                than folded into `purge_guard_refused`, mirroring why
+                `crawl_truncated` stays separate from `crawl_aborted_early`
+                below: same downstream consequence, but a different guard an
+                operator debugging a "partial" status needs to be able to
+                tell apart from an ordinary missing-page purge refusal)
       partial - `crawl_aborted_early` (the crawl broke off mid-stream; every
                 page it did reach may have succeeded, but the corpus is
                 incomplete)
@@ -376,6 +385,9 @@ def classify_sync(
         return "failed"
 
     if purge_guard_refused:
+        return "partial"
+
+    if injection_guard_refused:
         return "partial"
 
     if crawl_aborted_early:
@@ -760,7 +772,7 @@ def set_injection_decision(
         conn.commit()
 
 
-def index_quarantined_page(conn: psycopg.Connection, quarantine_id: int) -> int:
+def index_quarantined_page(conn: psycopg.Connection, quarantine_id: int, *, decided_by: str | None = None) -> int:
     """The "Allow" mechanics: chunk/embed/index a quarantine row's stored
     markdown IMMEDIATELY, rather than waiting for the page to be re-crawled
     on the next scheduled sync (which may be a day away, and which would
@@ -787,7 +799,7 @@ def index_quarantined_page(conn: psycopg.Connection, quarantine_id: int) -> int:
     chunks = chunker.chunk_markdown(entry.url, entry.markdown)
     chunks = embedder.embed_chunks(chunks)
     n = replace_page(conn, entry.source_id, entry.url, entry.content_hash, chunks)
-    set_injection_decision(conn, quarantine_id, "allowed")
+    set_injection_decision(conn, quarantine_id, "allowed", decided_by=decided_by)
     logger.info("injection_quarantine_allowed", url=entry.url, quarantine_id=quarantine_id, chunks=n)
     return n
 
@@ -1001,19 +1013,25 @@ def _apply_injection_gate(
     *,
     auto_purge: bool,
     log,
-) -> tuple[str, bool]:
+) -> tuple[str, str, bool]:
     """The injection-scan gate, run once per page ahead of the existing-hash
     skip (see `sync_source`'s integration comment for why that placement is
     load-bearing) and shared between the main crawl loop and the js_render
     retry loop.
 
-    Returns `(content_hash, blocked)`. `content_hash` is always computed
-    over `verdict.sanitized_markdown` (the text that would actually be
-    indexed), not raw `markdown` — hashing the raw text would desynchronize
-    `content_hash` from stored content and make a future ruleset change
-    permanently invisible to drift detection. `blocked` is True only when
-    `INJECTION_ENFORCE == "on"` and this exact `(url, content_hash)` must not
-    be indexed this sync.
+    Returns `(content_hash, sanitized_markdown, blocked)`. `content_hash` is
+    always computed over `sanitized_markdown` (the text that would actually
+    be indexed), not raw `markdown` — hashing the raw text would
+    desynchronize `content_hash` from stored content and make a future
+    ruleset change permanently invisible to drift detection. Callers MUST
+    chunk `sanitized_markdown`, not their own `markdown` variable: passing
+    raw markdown to `chunker.chunk_markdown` here would index invisible
+    characters (bidi overrides, variation-selector runs, illegitimate
+    joiners) `sanitize_for_storage` exists specifically to strip, silently
+    reopening the exact evasion channels this module defends against, one
+    layer downstream of the hash it just computed. `blocked` is True only
+    when `INJECTION_ENFORCE == "on"` and this exact `(url, content_hash)`
+    must not be indexed this sync.
 
     Every decision is content-addressed by `(url, content_hash)`: a prior
     `'allowed'` decision for this exact hash means a human already judged
@@ -1033,19 +1051,19 @@ def _apply_injection_gate(
     review) instead of `'quarantined'` when set.
     """
     if INJECTION_ENFORCE == "off":
-        return hash_markdown(markdown), False
+        return hash_markdown(markdown), markdown, False
 
     verdict = injection.scan(markdown)
     content_hash = hash_markdown(verdict.sanitized_markdown)
     prior_decision = decisions.get((url, content_hash))
 
     if prior_decision == "allowed":
-        return content_hash, False
+        return content_hash, verdict.sanitized_markdown, False
     if prior_decision in ("quarantined", "purged"):
-        return content_hash, INJECTION_ENFORCE == "on"
+        return content_hash, verdict.sanitized_markdown, INJECTION_ENFORCE == "on"
 
     if not verdict.flagged:
-        return content_hash, False
+        return content_hash, verdict.sanitized_markdown, False
 
     # Freshly flagged: no prior decision exists for this exact (url, hash).
     # Stores `verdict.sanitized_markdown`, NOT raw `markdown` — content_hash
@@ -1071,7 +1089,7 @@ def _apply_injection_gate(
         state=state,
         enforce=INJECTION_ENFORCE,
     )
-    return content_hash, INJECTION_ENFORCE == "on"
+    return content_hash, verdict.sanitized_markdown, INJECTION_ENFORCE == "on"
 
 
 def _update_source_status(conn: psycopg.Connection, name: str, status: str) -> None:
@@ -1298,7 +1316,7 @@ def sync_source(
                 # here rather than inside extract.extract, which the
                 # llms.txt path bypasses entirely).
 
-                content_hash, blocked = _apply_injection_gate(
+                content_hash, sanitized_markdown, blocked = _apply_injection_gate(
                     conn, source_id, url, markdown, injection_decisions,
                     auto_purge=injection_auto_purge, log=log,
                 )
@@ -1322,7 +1340,12 @@ def sync_source(
                         progress_cb(outcome, url)
                     continue
 
-                chunks = chunker.chunk_markdown(url, markdown)
+                # Chunk the SANITIZED text, not raw `markdown` — content_hash
+                # above was computed over this same text, and chunking raw
+                # markdown instead would index invisible characters
+                # sanitize_for_storage exists to strip (see
+                # _apply_injection_gate's docstring).
+                chunks = chunker.chunk_markdown(url, sanitized_markdown)
                 chunks = embedder.embed_chunks(chunks)
                 n = replace_page(
                     conn,
@@ -1435,7 +1458,7 @@ def sync_source(
                 markdown = re_extraction.markdown
                 assert markdown is not None
 
-                content_hash, blocked = _apply_injection_gate(
+                content_hash, sanitized_markdown, blocked = _apply_injection_gate(
                     conn, source_id, suspect_url, markdown, injection_decisions,
                     auto_purge=injection_auto_purge, log=log,
                 )
@@ -1458,7 +1481,9 @@ def sync_source(
                     log.info("js_render_retry_unchanged", url=suspect_url)
                     continue
 
-                chunks = chunker.chunk_markdown(suspect_url, markdown)
+                # Chunk the SANITIZED text — see the main crawl loop's
+                # identical comment above `_apply_injection_gate`'s call.
+                chunks = chunker.chunk_markdown(suspect_url, sanitized_markdown)
                 chunks = embedder.embed_chunks(chunks)
                 n = replace_page(
                     conn,
@@ -1584,6 +1609,7 @@ def sync_source(
             existing_count=current_existing_count,
             guard_refused_out=injection_guard_refused_flag,
         )
+    injection_guard_refused = bool(injection_guard_refused_flag)
 
     if cancel_event and cancel_event.is_set():
         outcome.status = "failed"
@@ -1593,6 +1619,7 @@ def sync_source(
             outcome,
             crawl_aborted_early=crawl_aborted_early,
             purge_guard_refused=purge_guard_refused,
+            injection_guard_refused=injection_guard_refused,
             crawl_truncated=crawl_truncated,
         )
 
@@ -1768,7 +1795,7 @@ def ingest_uploaded_docs(
     for doc in docs:
         url = f"upload://{source.name}/{doc.rel_path}"
         try:
-            content_hash, blocked = _apply_injection_gate(
+            content_hash, sanitized_markdown, blocked = _apply_injection_gate(
                 conn, source.id, url, doc.markdown, injection_decisions,
                 auto_purge=source.injection_auto_purge, log=log,
             )
@@ -1798,7 +1825,8 @@ def ingest_uploaded_docs(
                     progress_cb(outcome, url)
                 continue
 
-            chunks = chunker.chunk_markdown(url, doc.markdown)
+            # Chunk the SANITIZED text — see _apply_injection_gate's docstring.
+            chunks = chunker.chunk_markdown(url, sanitized_markdown)
             chunks = embedder.embed_chunks(chunks)
             n = replace_page(
                 conn,

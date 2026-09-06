@@ -2434,10 +2434,13 @@ def test_quarantine_purged_tombstones_rather_than_deletes(conn):
     assert decisions[("https://docs-fixture.dev/evil", "b" * 64)] == "purged"
 
 
-def test_index_quarantined_page_indexes_immediately_and_nulls_markdown(conn, monkeypatch):
+def test_index_quarantined_page_indexes_immediately_and_keeps_markdown(conn, monkeypatch):
     """What breaks if this fails: clicking Allow in the admin UI would leave
     the page unsearchable until the next scheduled sync (which may re-fetch
-    different content than what was actually reviewed and approved)."""
+    different content than what was actually reviewed and approved) — or the
+    retained `markdown` (the durable audit trail of exactly what a reviewer
+    approved, see `set_injection_decision`'s docstring) would be silently
+    dropped on Allow, when only Purge is supposed to null it."""
     _use_fast_chunk_and_embed(monkeypatch)
     source_id = store.ensure_source(conn, make_source())
     store.record_injection_detection(
@@ -2463,7 +2466,7 @@ def test_index_quarantined_page_indexes_immediately_and_nulls_markdown(conn, mon
     entry = store.get_quarantine_entry(conn, quarantine_id)
     assert entry is not None
     assert entry.state == "allowed"
-    assert entry.markdown is None, "content now lives in doc_chunks; storing it twice is pointless"
+    assert entry.markdown is not None, "Allow must keep markdown as an audit trail; only Purge nulls it"
 
 
 def test_index_quarantined_page_raises_for_already_purged_entry(conn):
@@ -2831,6 +2834,33 @@ def test_sync_source_auto_purge_defaults_off_for_an_ordinary_source(conn, monkey
         state, markdown = cur.fetchone()
     assert state == "quarantined"
     assert markdown is not None
+
+
+def test_sync_source_indexes_sanitized_text_not_raw_markdown(conn, monkeypatch):
+    """Regression: `_apply_injection_gate` computes `content_hash` from
+    `verdict.sanitized_markdown`, but earlier only returned `(content_hash,
+    blocked)` — every caller then chunked its own raw `markdown` variable
+    instead, silently reindexing the exact invisible-character evasion
+    channels `sanitize_for_storage` exists to close, one layer downstream of
+    the hash that was just computed from the sanitized text."""
+    _use_fast_chunk_and_embed(monkeypatch)
+    zwsp = "​"
+    page_markdown = f"# Widget\n\nConfigure the wid{zwsp}get subsystem here. " * 5
+    assert zwsp in page_markdown  # sanity: the fixture actually contains it
+    _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/widget": page_markdown})
+
+    outcome = store.sync_source(make_source(), conn)
+    assert outcome.injection_blocked == 0, "ordinary benign content must never be quarantined"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.content FROM doc_chunks c JOIN doc_pages p ON c.page_id = p.id WHERE p.url = %s",
+            ("https://docs-fixture.dev/widget",),
+        )
+        rows = cur.fetchall()
+    assert rows, "page must have been indexed"
+    combined = " ".join(r[0] for r in rows)
+    assert zwsp not in combined, "raw markdown was chunked instead of sanitized_markdown"
 
 
 def test_sync_source_auto_purge_true_purges_silently_on_a_crawl_source(conn, monkeypatch):

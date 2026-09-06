@@ -336,6 +336,18 @@ NEGATIVES = [
         "регистре. Значение по умолчанию указано в скобках." * 3,
     ),
     (
+        # Regression case for a real false positive found in review:
+        # scientific/math documentation legitimately mixes Latin variable
+        # names with Greek-letter subscripts (x_α, θ_target) in a single
+        # token — each such token trips the "mixed Latin + confusable
+        # script" detector, but folding them changes nothing a lexical rule
+        # cares about, so this must stay well under threshold.
+        "math_doc_greek_letter_variables",
+        "# Gradient Descent\n\nThe update rule is x_α = x_α - η * grad(f)(x_α). "
+        "Here β_target and θ_α are hyperparameters tuned via cross-validation. "
+        "The learning rate α controls step size; β controls momentum." * 3,
+    ),
+    (
         "base64_binary_blob_in_docs",
         "# Auth Tokens\n\nAn example signed token payload looks like:\n\n"
         + base64.b64encode(b"\x00\x01\x02\xffrandombinarydataAAAAbbbb1234").decode()
@@ -364,6 +376,20 @@ NEGATIVES = [
         "presentation over text presentation: ❤️ renders as a red heart, "
         "while ☺️ and ✔️ use the same U+FE0F selector. Each of these is a "
         "single base character followed by exactly one selector." * 3,
+    ),
+    (
+        # Regression case for a real false positive found in review: a
+        # legitimate RFC 5646 emoji subdivision-flag sequence (Scotland
+        # here) contains 6-7 Unicode Tags-block characters — the exact
+        # range Tier S treats as "ASCII smuggling" — and repeating it a
+        # few times (as a region picker plausibly would) must not
+        # accumulate into a tag_char_count that scan() treats as a
+        # confirmed smuggled payload.
+        "emoji_subdivision_flag_region_picker",
+        "# Regional Settings\n\nSelect your region: "
+        "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f Scotland, "
+        "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f England, or "
+        "\U0001f3f4\U000e0067\U000e0062\U000e0077\U000e006c\U000e0073\U000e007f Wales.",
     ),
 ]
 

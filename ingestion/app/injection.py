@@ -225,7 +225,14 @@ class InvisibleReport:
 
 
 def _inspect_invisibles(text: str) -> InvisibleReport:
-    tag_chars = sum(1 for ch in text if 0xE0000 <= ord(ch) <= 0xE007F)
+    # Valid emoji subdivision-flag sequences (Scotland/England/Wales, RFC
+    # 5646) are excluded BEFORE counting: each one legitimately contains 6-7
+    # Tags-block characters, and without this exclusion a page using them a
+    # few times racks up a tag_char_count that scan() below treats as
+    # confirmed ASCII smuggling — a real false positive at score 100, caught
+    # in review.
+    tag_free = _VALID_TAG_SEQUENCE.sub("", text)
+    tag_chars = sum(1 for ch in tag_free if 0xE0000 <= ord(ch) <= 0xE007F)
     bidi = sum(1 for ch in text if ch in "‪‫‬‭‮⁦⁧⁨⁩")
     intraword = len(re.findall(r"(?<=[A-Za-z])[​‌‍⁠﻿­](?=[A-Za-z])", text))
     vs_run_chars = sum(len(run) for run in _VS_RUN.findall(text))
@@ -336,18 +343,26 @@ def _find_homoglyph_tokens(text: str) -> list[str]:
     ]
 
 
-def normalize_for_detection(text: str) -> str:
+def normalize_for_detection(text: str, *, fold_homoglyphs: bool = True) -> str:
     """Aggressively flatten `text` into the view Layer 2 rules see. Discarded
     immediately after scoring, never stored — so unlike `sanitize_for_storage`
     it strips ALL zero-width joiners regardless of context, decodes (rather
     than deletes) the Unicode Tags block and variation-selector runs so the
     scorer sees the smuggled text, applies NFKC to fold Mathematical/
-    fullwidth Latin lookalikes (𝐢𝐠𝐧𝐨𝐫𝐞, ｉｇｎｏｒｅ) onto plain ASCII, and folds
-    homoglyph-substituted Latin lookalikes inside mixed-script tokens (see
-    `_fold_confusable_homoglyphs`). NFKC/confusable-folding are banned from
-    the storage view because both also rewrite legitimate content (fullwidth
-    punctuation in CJK docs, ligatures, genuine non-Latin prose) —
-    detection-view only.
+    fullwidth Latin lookalikes (𝐢𝐠𝐧𝐨𝐫𝐞, ｉｇｎｏｒｅ) onto plain ASCII, and (unless
+    `fold_homoglyphs=False`) folds homoglyph-substituted Latin lookalikes
+    inside mixed-script tokens (see `_fold_confusable_homoglyphs`). NFKC/
+    confusable-folding are banned from the storage view because both also
+    rewrite legitimate content (fullwidth punctuation in CJK docs,
+    ligatures, genuine non-Latin prose) — detection-view only.
+
+    `fold_homoglyphs=False` exists solely for `scan()`'s causation check: it
+    lets the scorer ask "does folding THIS page's confusable tokens change
+    which lexical rules match", rather than crediting the homoglyph signal
+    with full confidence just because *some* rule matched anywhere on the
+    page (which could be true for reasons unrelated to the fold, and would
+    over-score ordinary pages that happen to mix scripts incidentally, e.g.
+    scientific docs using Greek-letter variable names like `x_α`).
     """
     smuggled = decode_tag_characters(text)
     vs_smuggled = decode_variation_selectors(text)
@@ -356,7 +371,8 @@ def normalize_for_detection(text: str) -> str:
     body = _ALL_JOINERS.sub("", body)
     body = _VS_RUN.sub(" ", body)
     body = unicodedata.normalize("NFKC", body)
-    body = _fold_confusable_homoglyphs(body)
+    if fold_homoglyphs:
+        body = _fold_confusable_homoglyphs(body)
     if smuggled:
         body = f"{body}\n\n{smuggled}"
     if vs_smuggled:
@@ -725,11 +741,19 @@ def scan(markdown: str, *, ruleset: Ruleset | None = None) -> InjectionVerdict:
             invisibles.intraword_zero_width_count, "",
         ))
     if invisibles.tag_char_count:
-        weight = 100
-        payload_hits = _score_lexical(normalize_for_detection(invisibles.decoded_tag_payload), [], rs,
-                                       force_context="prose")
-        if payload_hits:
-            weight = 100
+        # tag_char_count already excludes valid emoji subdivision-flag
+        # sequences (see _inspect_invisibles) — any count reaching here is
+        # tag-block usage with no legitimate explanation. Still only
+        # escalates to 100 (unambiguous ASCII smuggling) when the decoded
+        # payload actually trips a lexical rule; bare presence alone (e.g. a
+        # malformed/partial tag sequence) scores 70, same posture as the
+        # variation-selector and base64 concealment signals below.
+        payload_hits = (
+            _score_lexical(normalize_for_detection(invisibles.decoded_tag_payload), [], rs,
+                            force_context="prose")
+            if invisibles.decoded_tag_payload else []
+        )
+        weight = 100 if payload_hits else 70
         concealment_hits.append(RuleHit(
             "hidden.tag_chars", "concealment", weight, "concealed",
             invisibles.tag_char_count, invisibles.decoded_tag_payload[:160],
@@ -752,7 +776,17 @@ def scan(markdown: str, *, ruleset: Ruleset | None = None) -> InjectionVerdict:
 
     homoglyph_tokens = _find_homoglyph_tokens(markdown)
     if homoglyph_tokens:
-        weight = min(100, 40 + 20 * len(homoglyph_tokens))
+        # Escalate to 100 only when folding is what CAUSES a lexical rule to
+        # match — comparing against a same-length, same-offsets unfolded
+        # view (folding is always a 1:1 codepoint substitution, so `spans`
+        # computed from the folded `detect_view` stays valid here). Without
+        # this check, a handful of scientific/math-doc tokens that
+        # incidentally mix scripts (e.g. `x_α`, `θ_target`) could reach
+        # weight 100 with zero lexical corroboration — flagged in review.
+        unfolded_view = normalize_for_detection(markdown, fold_homoglyphs=False)
+        unfolded_hits = _score_lexical(unfolded_view, spans, rs)
+        fold_caused_a_hit = {h.rule_id for h in hits} != {h.rule_id for h in unfolded_hits}
+        weight = 100 if fold_caused_a_hit else min(60, 20 + 10 * len(homoglyph_tokens))
         concealment_hits.append(RuleHit(
             "hidden.homoglyph_confusable", "concealment", weight, "concealed",
             len(homoglyph_tokens), homoglyph_tokens[0][:160],
